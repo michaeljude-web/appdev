@@ -1,0 +1,36 @@
+CREATE TABLE admin(
+id INT AUTO_INCREMENT PRIMARY KEY,
+username VARChar(255) NOT NULL,
+password varchar(255) NOT NULL
+);
+
+CREATE TABLE staff (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    firstname VARCHAR(50),
+    lastname VARCHAR(50),
+    address TEXT,
+    contact_number VARCHAR(20),
+    age INT,
+    username VARCHAR(50) UNIQUE,
+    password VARCHAR(100)
+);
+
+CREATE TABLE categories (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(50) NOT NULL UNIQUE
+);
+
+CREATE TABLE menu (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    category_id INT,
+    image_path VARCHAR(255),
+    is_available BOOLEAN DEFAULT TRUE,
+    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
+);
+ALTER TABLE menu ADD COLUMN stock INT DEFAULT 0;
+
+sudo cp -r ~/Documents/app /opt/lampp/htdocs/
+
+pip install opencv-python pyzbar pillow mysql-connector-python
