@@ -35,6 +35,13 @@ function getImageSrc($db_path) {
     return null;
 }
 
+function generateOrderCode($conn) {
+    $result = $conn->query("SELECT MAX(CAST(order_code AS UNSIGNED)) AS last_num FROM orders WHERE order_code REGEXP '^[0-9]+$'");
+    $row = $result->fetch_assoc();
+    $next = ((int)$row['last_num']) + 1;
+    return str_pad($next, 5, '0', STR_PAD_LEFT);
+}
+
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_to_cart'])) {
     $menu_id = $_POST['menu_id'];
     $quantity = (int)$_POST['quantity'];
@@ -78,10 +85,7 @@ if (isset($_GET['remove'])) {
 }
 
 if (isset($_POST['checkout'])) {
-    $customer_name = trim($_POST['customer_name']);
-    if (empty($customer_name)) {
-        $error = "Please enter your name.";
-    } elseif (empty($_SESSION['cart'])) {
+    if (empty($_SESSION['cart'])) {
         $error = "Your cart is empty.";
     } else {
         $stock_ok = true;
@@ -100,9 +104,13 @@ if (isset($_POST['checkout'])) {
             foreach ($_SESSION['cart'] as $item) {
                 $total += $item['price'] * $item['quantity'];
             }
-            $order_code = 'ORD' . time() . rand(100, 999);
-            $stmt = $conn->prepare("INSERT INTO orders (order_code, customer_name, total_amount) VALUES (?, ?, ?)");
-            $stmt->bind_param("ssd", $order_code, $customer_name, $total);
+
+            // --- Sequential order code: 00001, 00002, 00003 ... ---
+            $order_code = generateOrderCode($conn);
+            // -------------------------------------------------------
+
+            $stmt = $conn->prepare("INSERT INTO orders (order_code, total_amount) VALUES (?, ?)");
+            $stmt->bind_param("sd", $order_code, $total);
             $stmt->execute();
             $order_id = $stmt->insert_id;
             $stmt_item = $conn->prepare("INSERT INTO order_items (order_id, menu_id, quantity, price) VALUES (?, ?, ?, ?)");
@@ -113,7 +121,7 @@ if (isset($_POST['checkout'])) {
                 $stmt_update_stock->bind_param("ii", $item['quantity'], $menu_id);
                 $stmt_update_stock->execute();
             }
-            
+
             // ========== OFFLINE QR CODE GENERATION (phpqrcode) ==========
             require_once 'phpqrcode/phpqrcode.php';
             $qr_data = "http://" . $_SERVER['HTTP_HOST'] . dirname($_SERVER['SCRIPT_NAME']) . "/staff_scan.php?code=" . $order_code;
@@ -121,7 +129,7 @@ if (isset($_POST['checkout'])) {
             if (!is_dir('qr_codes')) mkdir('qr_codes', 0777, true);
             QRcode::png($qr_data, $qr_filename, QR_ECLEVEL_L, 10);
             // ========== END OFFLINE QR ==========
-            
+
             $_SESSION['cart'] = [];
             header("Location: index.php?success=1&order_code=" . $order_code);
             exit;
@@ -188,11 +196,7 @@ foreach ($_SESSION['cart'] as $item) {
             justify-content: space-between;
             height: 64px;
         }
-        .brand {
-            display: flex;
-            flex-direction: column;
-            line-height: 1.1;
-        }
+        .brand { display: flex; flex-direction: column; line-height: 1.1; }
         .brand-name {
             font-family: 'Playfair Display', serif;
             font-size: 1.15rem;
@@ -235,7 +239,6 @@ foreach ($_SESSION['cart'] as $item) {
             font-size: 0.72rem;
             font-weight: 700;
         }
-        .cart-icon { font-size: 1rem; }
 
         .hero {
             background: linear-gradient(135deg, #1a0a00 0%, #0d0d0d 60%);
@@ -272,11 +275,7 @@ foreach ($_SESSION['cart'] as $item) {
             position: relative;
         }
         .hero h1 span { color: var(--accent); }
-        .hero p {
-            color: var(--text2);
-            font-size: 0.95rem;
-            position: relative;
-        }
+        .hero p { color: var(--text2); font-size: 0.95rem; position: relative; }
 
         .main-wrap {
             max-width: 1320px;
@@ -287,7 +286,6 @@ foreach ($_SESSION['cart'] as $item) {
             gap: 28px;
             align-items: start;
         }
-
         .section-label {
             font-size: 0.65rem;
             letter-spacing: 3px;
@@ -327,12 +325,7 @@ foreach ($_SESSION['cart'] as $item) {
             background: var(--surface2);
             position: relative;
         }
-        .card-img-wrap img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            transition: transform 0.4s;
-        }
+        .card-img-wrap img { width: 100%; height: 100%; object-fit: cover; transition: transform 0.4s; }
         .menu-card:hover .card-img-wrap img { transform: scale(1.06); }
         .card-placeholder {
             width: 100%;
@@ -345,8 +338,7 @@ foreach ($_SESSION['cart'] as $item) {
         }
         .out-badge {
             position: absolute;
-            top: 8px;
-            left: 8px;
+            top: 8px; left: 8px;
             background: var(--danger);
             color: white;
             font-size: 0.6rem;
@@ -373,17 +365,9 @@ foreach ($_SESSION['cart'] as $item) {
             color: var(--accent);
             margin-bottom: 6px;
         }
-        .card-stock {
-            font-size: 0.7rem;
-            color: var(--text3);
-            margin-bottom: 10px;
-        }
+        .card-stock { font-size: 0.7rem; color: var(--text3); margin-bottom: 10px; }
         .card-stock.low { color: var(--gold); }
-        .add-row {
-            display: flex;
-            gap: 6px;
-            align-items: center;
-        }
+        .add-row { display: flex; gap: 6px; align-items: center; }
         .qty-input {
             width: 52px;
             background: var(--surface2);
@@ -426,17 +410,13 @@ foreach ($_SESSION['cart'] as $item) {
             align-items: center;
             justify-content: space-between;
         }
-        .cart-header-left h2 {
-            font-family: 'Playfair Display', serif;
-            font-size: 1.2rem;
-        }
+        .cart-header-left h2 { font-family: 'Playfair Display', serif; font-size: 1.2rem; }
         .cart-header-left p { font-size: 0.75rem; color: var(--text2); margin-top: 2px; }
         .cart-count-badge {
             background: var(--accent);
             color: white;
             border-radius: 50%;
-            width: 28px;
-            height: 28px;
+            width: 28px; height: 28px;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -446,12 +426,7 @@ foreach ($_SESSION['cart'] as $item) {
         .cart-items { padding: 16px 22px; max-height: 320px; overflow-y: auto; }
         .cart-items::-webkit-scrollbar { width: 4px; }
         .cart-items::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-        .cart-empty {
-            text-align: center;
-            color: var(--text3);
-            padding: 32px 0;
-            font-size: 0.85rem;
-        }
+        .cart-empty { text-align: center; color: var(--text3); padding: 32px 0; font-size: 0.85rem; }
         .cart-empty .empty-icon { font-size: 2.5rem; margin-bottom: 8px; }
         .cart-row {
             display: flex;
@@ -464,13 +439,7 @@ foreach ($_SESSION['cart'] as $item) {
         @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
         .cart-row:last-child { border-bottom: none; }
         .cart-row-info { flex: 1; min-width: 0; }
-        .cart-row-name {
-            font-size: 0.85rem;
-            font-weight: 600;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
+        .cart-row-name { font-size: 0.85rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .cart-row-detail { font-size: 0.75rem; color: var(--text2); margin-top: 2px; }
         .cart-row-subtotal { font-size: 0.85rem; font-weight: 700; color: var(--accent); white-space: nowrap; }
         .btn-remove {
@@ -498,20 +467,6 @@ foreach ($_SESSION['cart'] as $item) {
             font-weight: 700;
             color: var(--accent);
         }
-        .name-input {
-            width: 100%;
-            background: var(--surface2);
-            border: 1px solid var(--border);
-            color: var(--text);
-            padding: 11px 16px;
-            border-radius: 12px;
-            font-family: 'DM Sans', sans-serif;
-            font-size: 0.9rem;
-            margin-bottom: 12px;
-            transition: border-color 0.2s;
-        }
-        .name-input:focus { outline: none; border-color: var(--accent); }
-        .name-input::placeholder { color: var(--text3); }
         .btn-checkout {
             width: 100%;
             background: linear-gradient(135deg, var(--accent), #ea580c);
@@ -540,12 +495,7 @@ foreach ($_SESSION['cart'] as $item) {
             margin-top: 10px;
         }
 
-        .success-wrap {
-            max-width: 520px;
-            margin: 60px auto;
-            padding: 0 20px;
-            text-align: center;
-        }
+        .success-wrap { max-width: 520px; margin: 60px auto; padding: 0 20px; text-align: center; }
         .success-card {
             background: var(--surface);
             border: 1px solid var(--border);
@@ -553,8 +503,7 @@ foreach ($_SESSION['cart'] as $item) {
             padding: 40px 32px;
         }
         .success-icon {
-            width: 64px;
-            height: 64px;
+            width: 64px; height: 64px;
             background: rgba(34,197,94,0.15);
             border: 2px solid var(--success);
             border-radius: 50%;
@@ -564,11 +513,7 @@ foreach ($_SESSION['cart'] as $item) {
             font-size: 1.8rem;
             margin: 0 auto 20px;
         }
-        .success-card h2 {
-            font-family: 'Playfair Display', serif;
-            font-size: 1.8rem;
-            margin-bottom: 8px;
-        }
+        .success-card h2 { font-family: 'Playfair Display', serif; font-size: 1.8rem; margin-bottom: 8px; }
         .success-card p { color: var(--text2); font-size: 0.9rem; margin-bottom: 6px; }
         .order-code-badge {
             display: inline-block;
@@ -589,11 +534,7 @@ foreach ($_SESSION['cart'] as $item) {
             margin-bottom: 24px;
         }
         .qr-wrap img { display: block; border-radius: 8px; }
-        .qr-hint {
-            font-size: 0.75rem;
-            color: var(--text3);
-            margin-bottom: 24px;
-        }
+        .qr-hint { font-size: 0.75rem; color: var(--text3); margin-bottom: 24px; }
         .btn-new-order {
             display: inline-flex;
             align-items: center;
@@ -609,11 +550,7 @@ foreach ($_SESSION['cart'] as $item) {
         }
         .btn-new-order:hover { background: var(--accent2); transform: scale(0.97); }
 
-        .orders-wrap {
-            max-width: 1320px;
-            margin: 0 auto 40px;
-            padding: 0 20px;
-        }
+        .orders-wrap { max-width: 1320px; margin: 0 auto 40px; padding: 0 20px; }
         .table-card {
             background: var(--surface);
             border: 1px solid var(--border);
@@ -627,15 +564,9 @@ foreach ($_SESSION['cart'] as $item) {
             align-items: center;
             justify-content: space-between;
         }
-        .table-card-header h2 {
-            font-family: 'Playfair Display', serif;
-            font-size: 1.2rem;
-        }
+        .table-card-header h2 { font-family: 'Playfair Display', serif; font-size: 1.2rem; }
         .table-card-header span { font-size: 0.75rem; color: var(--text2); }
-        .orders-table {
-            width: 100%;
-            border-collapse: collapse;
-        }
+        .orders-table { width: 100%; border-collapse: collapse; }
         .orders-table thead th {
             padding: 12px 18px;
             text-align: left;
@@ -666,19 +597,8 @@ foreach ($_SESSION['cart'] as $item) {
         .status-pending { background: rgba(245,158,11,0.15); color: var(--gold); border: 1px solid rgba(245,158,11,0.3); }
         .status-done { background: rgba(34,197,94,0.1); color: var(--success); border: 1px solid rgba(34,197,94,0.25); }
         .order-amount { color: var(--accent); font-weight: 700; font-family: 'Playfair Display', serif; }
-        .qr-mini {
-            width: 48px;
-            height: 48px;
-            border-radius: 6px;
-            background: white;
-            padding: 2px;
-        }
-        .empty-table {
-            text-align: center;
-            color: var(--text3);
-            padding: 40px;
-            font-size: 0.85rem;
-        }
+        .qr-mini { width: 48px; height: 48px; border-radius: 6px; background: white; padding: 2px; }
+        .empty-table { text-align: center; color: var(--text3); padding: 40px; font-size: 0.85rem; }
 
         @media (max-width: 900px) {
             .main-wrap { grid-template-columns: 1fr; }
@@ -716,7 +636,7 @@ foreach ($_SESSION['cart'] as $item) {
     <p>Pick your items · Place order · Show QR to staff</p>
 </div>
 
-<?php if (isset($_GET['success']) && $_GET['success'] == 1 && isset($_GET['order_code'])): 
+<?php if (isset($_GET['success']) && $_GET['success'] == 1 && isset($_GET['order_code'])):
     $order_code = $_GET['order_code'];
 ?>
 <div class="success-wrap">
@@ -733,7 +653,6 @@ foreach ($_SESSION['cart'] as $item) {
             if (file_exists($qr_file)) {
                 $qr_img_src = htmlspecialchars($qr_file);
             } else {
-                // Fallback only if offline generation failed (should not happen)
                 $qr_data_fallback = "http://" . $_SERVER['HTTP_HOST'] . dirname($_SERVER['SCRIPT_NAME']) . "/staff_scan.php?code=" . $order_code;
                 $qr_img_src = "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" . urlencode($qr_data_fallback);
             }
@@ -829,7 +748,6 @@ foreach ($_SESSION['cart'] as $item) {
                 </div>
                 <?php if (!empty($_SESSION['cart'])): ?>
                 <form method="post">
-                    <input type="text" name="customer_name" class="name-input" placeholder="Your name" required>
                     <button type="submit" name="checkout" class="btn-checkout">
                         🧾 Place Order & Get QR
                     </button>
@@ -845,7 +763,7 @@ foreach ($_SESSION['cart'] as $item) {
 
 <?php
 $orders_result = $conn->query("
-    SELECT o.id, o.order_code, o.customer_name, o.total_amount, o.created_at,
+    SELECT o.id, o.order_code, o.total_amount, o.created_at,
            GROUP_CONCAT(m.name ORDER BY m.name SEPARATOR ', ') AS items,
            o.status
     FROM orders o
@@ -869,7 +787,6 @@ $orders_result = $conn->query("
                     <tr>
                         <th>QR</th>
                         <th>Order Code</th>
-                        <th>Customer</th>
                         <th>Items</th>
                         <th>Total</th>
                         <th>Status</th>
@@ -890,7 +807,6 @@ $orders_result = $conn->query("
                         <?php endif; ?>
                     </td>
                     <td style="font-family:monospace;font-size:0.78rem;color:var(--accent);"><?php echo htmlspecialchars($ord['order_code']); ?></td>
-                    <td style="font-weight:600;"><?php echo htmlspecialchars($ord['customer_name']); ?></td>
                     <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2);font-size:0.8rem;"><?php echo htmlspecialchars($ord['items'] ?? '—'); ?></td>
                     <td class="order-amount">₱<?php echo number_format($ord['total_amount'], 2); ?></td>
                     <td>

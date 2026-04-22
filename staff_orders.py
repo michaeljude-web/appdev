@@ -34,6 +34,27 @@ STATUS_COLORS = {
     "cancelled": {"bg": "#fdedec", "fg": "#c0392b", "badge": "#e74c3c"},
 }
 
+def generate_order_code():
+    """Generate next sequential order code like 00001, 00002, 00003..."""
+    conn = connect_db()
+    if not conn:
+        return "00001"
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_code FROM orders ORDER BY id DESC LIMIT 1")
+    last = cursor.fetchone()
+    conn.close()
+    if last and last[0] and last[0].isdigit():
+        return str(int(last[0]) + 1).zfill(5)
+    # If no orders yet or old format codes exist, count total orders + 1
+    conn = connect_db()
+    if not conn:
+        return "00001"
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM orders")
+    count = cursor.fetchone()[0]
+    conn.close()
+    return str(count + 1).zfill(5)
+
 def refresh_orders(tree, details_card, status_filter="pending"):
     for row in tree.get_children():
         tree.delete(row)
@@ -43,12 +64,12 @@ def refresh_orders(tree, details_card, status_filter="pending"):
     cursor = conn.cursor(dictionary=True)
     if status_filter == "all":
         cursor.execute("""
-            SELECT id, order_code, customer_name, total_amount, created_at, status
+            SELECT id, order_code, total_amount, created_at, status
             FROM orders ORDER BY created_at DESC
         """)
     else:
         cursor.execute("""
-            SELECT id, order_code, customer_name, total_amount, created_at, status
+            SELECT id, order_code, total_amount, created_at, status
             FROM orders WHERE status = %s ORDER BY created_at DESC
         """, (status_filter,))
     orders = cursor.fetchall()
@@ -58,7 +79,6 @@ def refresh_orders(tree, details_card, status_filter="pending"):
         status = order['status']
         tree.insert("", tk.END, iid=str(order['id']), values=(
             order['order_code'],
-            order['customer_name'],
             f"₱{order['total_amount']:.2f}",
             created,
             status.capitalize()
@@ -101,7 +121,7 @@ def show_order_details(order_id, details_card):
     if not conn:
         return
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, order_code, customer_name, total_amount, created_at, status FROM orders WHERE id = %s", (order_id,))
+    cursor.execute("SELECT id, order_code, total_amount, created_at, status FROM orders WHERE id = %s", (order_id,))
     order = cursor.fetchone()
     if not order:
         conn.close()
@@ -185,7 +205,7 @@ def edit_order(order_id, tree, details_card, status_filter_var):
     if not conn:
         return
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, order_code, customer_name, total_amount, status FROM orders WHERE id = %s", (order_id,))
+    cursor.execute("SELECT id, order_code, total_amount, status FROM orders WHERE id = %s", (order_id,))
     order = cursor.fetchone()
     if not order:
         conn.close()
@@ -461,12 +481,11 @@ class OrderDetailsCard(tk.Frame):
         meta.pack(fill="x")
 
         self.lbl_code     = tk.Label(meta, text="", font=("Segoe UI", 10), bg="white", fg="#555", anchor="w")
-        self.lbl_customer = tk.Label(meta, text="", font=("Segoe UI", 10), bg="white", fg="#555", anchor="w")
         self.lbl_date     = tk.Label(meta, text="", font=("Segoe UI", 10), bg="white", fg="#555", anchor="w")
         self.lbl_total    = tk.Label(meta, text="", font=("Segoe UI", 14, "bold"), bg="white", fg="#d35400", anchor="w")
         self.lbl_status   = tk.Label(meta, text="", font=("Segoe UI", 10, "bold"), bg="white", anchor="w")
 
-        for lbl in (self.lbl_code, self.lbl_customer, self.lbl_date, self.lbl_total, self.lbl_status):
+        for lbl in (self.lbl_code, self.lbl_date, self.lbl_total, self.lbl_status):
             lbl.pack(fill="x", pady=2)
 
         tk.Frame(self.body, bg="#eee", height=1).pack(fill="x", padx=16, pady=6)
@@ -511,7 +530,6 @@ class OrderDetailsCard(tk.Frame):
         self.body.pack(fill="both", expand=True)
 
         self.lbl_code.config(text=f"Order Code:  {order['order_code']}")
-        self.lbl_customer.config(text=f"Customer:  {order['customer_name']}")
         date_str = order['created_at'].strftime("%b %d, %Y  %H:%M") if order['created_at'] else ""
         self.lbl_date.config(text=f"Date:  {date_str}")
         self.lbl_total.config(text=f"₱{order['total_amount']:.2f}")
@@ -550,7 +568,7 @@ def show_order_modal(order_id, tree, details_card, status_filter_var):
     if not conn:
         return
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, order_code, customer_name, total_amount, created_at, status FROM orders WHERE id = %s", (order_id,))
+    cursor.execute("SELECT id, order_code, total_amount, created_at, status FROM orders WHERE id = %s", (order_id,))
     order = cursor.fetchone()
     if not order:
         conn.close()
@@ -589,7 +607,6 @@ def show_order_modal(order_id, tree, details_card, status_filter_var):
 
     for label, value in [
         ("Order Code", order['order_code']),
-        ("Customer",   order['customer_name']),
         ("Date",       order['created_at'].strftime("%b %d, %Y  %H:%M") if order['created_at'] else ""),
         ("Total",      f"₱{order['total_amount']:.2f}"),
     ]:
@@ -897,9 +914,14 @@ def direct_order(tree, details_card, status_filter_var):
             conn.close()
             return
 
-        order_code = 'ORD' + str(int(datetime.now().timestamp())) + str(random.randint(100, 999))
-        cursor.execute("INSERT INTO orders (order_code, customer_name, total_amount) VALUES (%s, %s, %s)",
-                       (order_code, "Direct", total))
+        # Sequential order code: 00001, 00002, 00003 ...
+        cursor.execute("SELECT MAX(CAST(order_code AS UNSIGNED)) FROM orders WHERE order_code REGEXP '^[0-9]+$'")
+        last_num = cursor.fetchone()[0]
+        order_code = str((last_num or 0) + 1).zfill(5)
+
+        # Insert order without customer_name
+        cursor.execute("INSERT INTO orders (order_code, total_amount, status) VALUES (%s, %s, 'pending')",
+                       (order_code, total))
         order_id = cursor.lastrowid
         for pid, item in cart.items():
             cursor.execute("INSERT INTO order_items (order_id, menu_id, quantity, price) VALUES (%s, %s, %s, %s)",
@@ -976,7 +998,7 @@ def main():
     scroll_y = ttk.Scrollbar(tree_frame, orient="vertical")
     scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal")
 
-    columns = ("Order Code", "Customer", "Total", "Date", "Status")
+    columns = ("Order Code", "Total", "Date", "Status")
     tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
                         style="Orders.Treeview",
                         yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
@@ -986,11 +1008,11 @@ def main():
     scroll_x.pack(side="bottom", fill="x")
     tree.pack(fill="both", expand=True)
 
-    col_widths = {"Order Code": 150, "Customer": 160, "Total": 100, "Date": 140, "Status": 100}
+    col_widths = {"Order Code": 150, "Total": 100, "Date": 140, "Status": 100}
     for col in columns:
         tree.heading(col, text=col)
         tree.column(col, width=col_widths[col],
-                    anchor="w" if col == "Customer" else "center")
+                    anchor="w" if col == "Order Code" else "center")
 
     right_frame = tk.Frame(main_panel, bg="#f5f6fa", width=380)
     right_frame.pack(side="right", fill="both")

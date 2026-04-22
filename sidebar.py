@@ -8,7 +8,6 @@ def add_sidebar(parent):
     sidebar.pack(side="left", fill="y")
     sidebar.pack_propagate(False)
 
-    # Header
     header_label = tk.Label(
         sidebar,
         text="Snack in Save\n9Nueve",
@@ -19,7 +18,6 @@ def add_sidebar(parent):
     )
     header_label.pack(fill="x")
 
-    # Divider
     tk.Frame(sidebar, bg="#3d5166", height=1).pack(fill="x", padx=15, pady=(0, 10))
 
     def navigate(page_script):
@@ -27,13 +25,11 @@ def add_sidebar(parent):
         subprocess.Popen([sys.executable, page_script])
         sys.exit()
 
-    # Nav buttons (excluding Logout)
     nav_buttons = [
         ("Dashboard", "admin_dashboard.py"),
         ("Account",   "admin_account.py"),
         ("Menu",      "admin_menu.py"),
-        ("Orders",    "admin_orders.py"),
-        ("Queue",     "admin_queue.py"),
+        ("Inventory", "admin_inventory.py"),
         ("Reports",   "admin_reports.py"),
     ]
 
@@ -58,7 +54,6 @@ def add_sidebar(parent):
         )
         btn.pack(fill="x", padx=10, pady=3)
 
-    # Logout — pinned to bottom
     bottom_frame = tk.Frame(sidebar, bg="#2c3e50")
     bottom_frame.pack(side="bottom", fill="x", padx=10, pady=15)
 
