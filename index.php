@@ -42,49 +42,7 @@ function generateOrderCode($conn) {
     return str_pad($next, 5, '0', STR_PAD_LEFT);
 }
 
-if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_to_cart'])) {
-    $menu_id = $_POST['menu_id'];
-    $quantity = (int)$_POST['quantity'];
-    $current_stock = getStock($conn, $menu_id);
-    if ($quantity > $current_stock) {
-        $_SESSION['error'] = "Sorry, only $current_stock item(s) available.";
-        header("Location: index.php");
-        exit;
-    }
-    $stmt = $conn->prepare("SELECT id, name, price FROM menu WHERE id = ?");
-    $stmt->bind_param("i", $menu_id);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    $item = $result->fetch_assoc();
-    if ($item) {
-        if (isset($_SESSION['cart'][$menu_id])) {
-            $new_qty = $_SESSION['cart'][$menu_id]['quantity'] + $quantity;
-            if ($new_qty > $current_stock) {
-                $_SESSION['error'] = "Cannot add $quantity. Total would exceed stock ($current_stock).";
-                header("Location: index.php");
-                exit;
-            }
-            $_SESSION['cart'][$menu_id]['quantity'] += $quantity;
-        } else {
-            $_SESSION['cart'][$menu_id] = [
-                'name' => $item['name'],
-                'price' => $item['price'],
-                'quantity' => $quantity
-            ];
-        }
-    }
-    header("Location: index.php");
-    exit;
-}
-
-if (isset($_GET['remove'])) {
-    $id = $_GET['remove'];
-    unset($_SESSION['cart'][$id]);
-    header("Location: index.php");
-    exit;
-}
-
-if (isset($_POST['checkout'])) {
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['checkout'])) {
     if (empty($_SESSION['cart'])) {
         $error = "Your cart is empty.";
     } else {
@@ -105,32 +63,29 @@ if (isset($_POST['checkout'])) {
                 $total += $item['price'] * $item['quantity'];
             }
 
-            // --- Sequential order code: 00001, 00002, 00003 ... ---
             $order_code = generateOrderCode($conn);
-            // -------------------------------------------------------
 
-            $stmt = $conn->prepare("INSERT INTO orders (order_code, total_amount) VALUES (?, ?)");
+            $stmt = $conn->prepare("INSERT INTO orders (order_code, total_amount, status) VALUES (?, ?, 'pending')");
             $stmt->bind_param("sd", $order_code, $total);
             $stmt->execute();
             $order_id = $stmt->insert_id;
+
             $stmt_item = $conn->prepare("INSERT INTO order_items (order_id, menu_id, quantity, price) VALUES (?, ?, ?, ?)");
-            $stmt_update_stock = $conn->prepare("UPDATE menu SET stock = stock - ? WHERE id = ?");
             foreach ($_SESSION['cart'] as $menu_id => $item) {
                 $stmt_item->bind_param("iiid", $order_id, $menu_id, $item['quantity'], $item['price']);
                 $stmt_item->execute();
-                $stmt_update_stock->bind_param("ii", $item['quantity'], $menu_id);
-                $stmt_update_stock->execute();
             }
 
-            // ========== OFFLINE QR CODE GENERATION (phpqrcode) ==========
-            require_once 'phpqrcode/phpqrcode.php';
-            $qr_data = "http://" . $_SERVER['HTTP_HOST'] . dirname($_SERVER['SCRIPT_NAME']) . "/staff_scan.php?code=" . $order_code;
-            $qr_filename = "qr_codes/" . $order_code . ".png";
-            if (!is_dir('qr_codes')) mkdir('qr_codes', 0777, true);
-            QRcode::png($qr_data, $qr_filename, QR_ECLEVEL_L, 10);
-            // ========== END OFFLINE QR ==========
+            if (file_exists('phpqrcode/phpqrcode.php')) {
+                require_once 'phpqrcode/phpqrcode.php';
+                $qr_data = "http://" . $_SERVER['HTTP_HOST'] . dirname($_SERVER['SCRIPT_NAME']) . "/staff_scan.php?code=" . $order_code;
+                $qr_filename = "qr_codes/" . $order_code . ".png";
+                if (!is_dir('qr_codes')) mkdir('qr_codes', 0777, true);
+                QRcode::png($qr_data, $qr_filename, QR_ECLEVEL_L, 10);
+            }
 
             $_SESSION['cart'] = [];
+            $_SESSION['last_order_code'] = $order_code;
             header("Location: index.php?success=1&order_code=" . $order_code);
             exit;
         }
@@ -142,475 +97,407 @@ if (isset($_SESSION['error'])) {
     unset($_SESSION['error']);
 }
 
+$categories_result = $conn->query("SELECT id, name FROM categories ORDER BY name");
+$categories = [];
+while ($cat_row = $categories_result->fetch_assoc()) {
+    $categories[] = $cat_row['name'];
+}
+$selected_cat = isset($_GET['cat']) ? $_GET['cat'] : '';
+
 $cart_count = 0;
 $cart_total = 0;
 foreach ($_SESSION['cart'] as $item) {
     $cart_count += $item['quantity'];
     $cart_total += $item['price'] * $item['quantity'];
 }
+
+$queue_order_code = isset($_GET['order_code']) ? $_GET['order_code'] : (isset($_SESSION['last_order_code']) ? $_SESSION['last_order_code'] : '');
+$queue_data = null;
+if ($queue_order_code) {
+    $stmt_q = $conn->prepare("SELECT id, status FROM orders WHERE order_code = ?");
+    $stmt_q->bind_param("s", $queue_order_code);
+    $stmt_q->execute();
+    $q_row = $stmt_q->get_result()->fetch_assoc();
+    if ($q_row) {
+        $stmt_pos = $conn->prepare("SELECT COUNT(*) AS pos FROM orders WHERE status IN ('pending','waiting') AND id < ?");
+        $stmt_pos->bind_param("i", $q_row['id']);
+        $stmt_pos->execute();
+        $pos_row = $stmt_pos->get_result()->fetch_assoc();
+        $queue_data = [
+            'code'     => $queue_order_code,
+            'status'   => $q_row['status'],
+            'position' => (int)$pos_row['pos'] + 1
+        ];
+    }
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Snack in Save 9Nueve</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg: #0d0d0d;
-            --surface: #161616;
-            --surface2: #1f1f1f;
-            --border: #2a2a2a;
-            --accent: #f97316;
-            --accent2: #fb923c;
-            --gold: #f59e0b;
-            --text: #f5f5f5;
-            --text2: #a3a3a3;
-            --text3: #525252;
-            --success: #22c55e;
-            --danger: #ef4444;
-            --radius: 20px;
-        }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snack in Save 9Nueve</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+    --bg: #0d0d0d;
+    --surface: #161616;
+    --surface2: #1f1f1f;
+    --border: #2a2a2a;
+    --accent: #f97316;
+    --accent2: #fb923c;
+    --gold: #f59e0b;
+    --text: #f5f5f5;
+    --text2: #a3a3a3;
+    --text3: #525252;
+    --success: #22c55e;
+    --danger: #ef4444;
+    --radius: 20px;
+    --pending-bg: rgba(245,158,11,0.12);
+    --pending-color: #f59e0b;
+    --waiting-bg: rgba(249,115,22,0.12);
+    --waiting-color: #f97316;
+    --serving-bg: rgba(34,197,94,0.12);
+    --serving-color: #22c55e;
+    --done-bg: rgba(99,102,241,0.1);
+    --done-color: #818cf8;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); font-family:'DM Sans',sans-serif; color:var(--text); min-height:100vh; }
 
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+.topnav {
+    position:sticky; top:0; z-index:200;
+    background:rgba(13,13,13,0.9);
+    backdrop-filter:blur(16px);
+    border-bottom:1px solid var(--border);
+    padding:0 24px;
+    display:flex; align-items:center; justify-content:space-between;
+    height:64px;
+}
+.brand { display:flex; flex-direction:column; line-height:1.1; }
+.brand-name { font-family:'Playfair Display',serif; font-size:1.15rem; font-weight:900; color:var(--accent); }
+.brand-sub { font-size:0.62rem; color:var(--text3); letter-spacing:2px; text-transform:uppercase; }
+.cart-pill {
+    display:flex; align-items:center; gap:8px;
+    background:var(--accent); color:white;
+    border:none; padding:8px 18px; border-radius:40px;
+    font-family:'DM Sans',sans-serif; font-weight:600; font-size:0.85rem;
+    cursor:pointer; transition:all 0.2s;
+}
+.cart-pill:hover { background:var(--accent2); transform:scale(0.97); }
+.cart-pill .badge {
+    background:white; color:var(--accent);
+    border-radius:50%; width:20px; height:20px;
+    display:flex; align-items:center; justify-content:center;
+    font-size:0.72rem; font-weight:700;
+}
 
-        body {
-            background: var(--bg);
-            font-family: 'DM Sans', sans-serif;
-            color: var(--text);
-            min-height: 100vh;
-        }
+.hero {
+    background:linear-gradient(135deg,#1a0a00 0%,#0d0d0d 60%);
+    padding:48px 24px 36px;
+    text-align:center;
+    border-bottom:1px solid var(--border);
+    position:relative; overflow:hidden;
+}
+.hero::before {
+    content:''; position:absolute; inset:0;
+    background:radial-gradient(ellipse at 50% 0%,rgba(249,115,22,0.13) 0%,transparent 70%);
+}
+.hero-label {
+    display:inline-block;
+    background:rgba(249,115,22,0.12);
+    border:1px solid rgba(249,115,22,0.28);
+    color:var(--accent); font-size:0.68rem; letter-spacing:3px;
+    text-transform:uppercase; padding:4px 14px; border-radius:40px; margin-bottom:14px;
+}
+.hero h1 {
+    font-family:'Playfair Display',serif;
+    font-size:clamp(1.8rem,6vw,3rem);
+    font-weight:900; line-height:1.05; margin-bottom:10px; position:relative;
+}
+.hero h1 span { color:var(--accent); }
+.hero p { color:var(--text2); font-size:0.9rem; position:relative; }
 
-        .topnav {
-            position: sticky;
-            top: 0;
-            z-index: 100;
-            background: rgba(13,13,13,0.85);
-            backdrop-filter: blur(16px);
-            border-bottom: 1px solid var(--border);
-            padding: 0 24px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            height: 64px;
-        }
-        .brand { display: flex; flex-direction: column; line-height: 1.1; }
-        .brand-name {
-            font-family: 'Playfair Display', serif;
-            font-size: 1.15rem;
-            font-weight: 900;
-            color: var(--accent);
-            letter-spacing: -0.5px;
-        }
-        .brand-sub {
-            font-size: 0.65rem;
-            color: var(--text3);
-            letter-spacing: 2px;
-            text-transform: uppercase;
-        }
-        .nav-right { display: flex; align-items: center; gap: 12px; }
-        .cart-pill {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            background: var(--accent);
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 40px;
-            font-family: 'DM Sans', sans-serif;
-            font-weight: 600;
-            font-size: 0.85rem;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-        .cart-pill:hover { background: var(--accent2); transform: scale(0.97); }
-        .cart-pill .badge {
-            background: white;
-            color: var(--accent);
-            border-radius: 50%;
-            width: 20px;
-            height: 20px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 0.72rem;
-            font-weight: 700;
-        }
+.main-wrap {
+    max-width:1400px; margin:0 auto;
+    padding:28px 20px;
+    display:grid;
+    grid-template-columns:1fr 360px;
+    gap:24px; align-items:start;
+}
+.section-label { font-size:0.63rem; letter-spacing:3px; text-transform:uppercase; color:var(--accent); margin-bottom:4px; }
+.section-title { font-family:'Playfair Display',serif; font-size:1.5rem; font-weight:700; margin-bottom:20px; }
 
-        .hero {
-            background: linear-gradient(135deg, #1a0a00 0%, #0d0d0d 60%);
-            padding: 56px 24px 40px;
-            text-align: center;
-            border-bottom: 1px solid var(--border);
-            position: relative;
-            overflow: hidden;
-        }
-        .hero::before {
-            content: '';
-            position: absolute;
-            inset: 0;
-            background: radial-gradient(ellipse at 50% 0%, rgba(249,115,22,0.15) 0%, transparent 70%);
-        }
-        .hero-label {
-            display: inline-block;
-            background: rgba(249,115,22,0.15);
-            border: 1px solid rgba(249,115,22,0.3);
-            color: var(--accent);
-            font-size: 0.7rem;
-            letter-spacing: 3px;
-            text-transform: uppercase;
-            padding: 5px 14px;
-            border-radius: 40px;
-            margin-bottom: 16px;
-        }
-        .hero h1 {
-            font-family: 'Playfair Display', serif;
-            font-size: clamp(2rem, 7vw, 3.5rem);
-            font-weight: 900;
-            line-height: 1.05;
-            margin-bottom: 12px;
-            position: relative;
-        }
-        .hero h1 span { color: var(--accent); }
-        .hero p { color: var(--text2); font-size: 0.95rem; position: relative; }
+.cat-filter {
+    display:flex; gap:8px; flex-wrap:wrap; margin-bottom:20px;
+}
+.cat-btn {
+    padding:6px 16px; border-radius:40px;
+    border:1px solid var(--border);
+    background:var(--surface); color:var(--text2);
+    font-family:'DM Sans',sans-serif; font-size:0.78rem; font-weight:500;
+    cursor:pointer; text-decoration:none; transition:all 0.18s;
+    white-space:nowrap;
+}
+.cat-btn:hover { border-color:var(--accent); color:var(--accent); }
+.cat-btn.active { background:var(--accent); border-color:var(--accent); color:white; font-weight:600; }
 
-        .main-wrap {
-            max-width: 1320px;
-            margin: 0 auto;
-            padding: 32px 20px;
-            display: grid;
-            grid-template-columns: 1fr 380px;
-            gap: 28px;
-            align-items: start;
-        }
-        .section-label {
-            font-size: 0.65rem;
-            letter-spacing: 3px;
-            text-transform: uppercase;
-            color: var(--accent);
-            margin-bottom: 6px;
-        }
-        .section-title {
-            font-family: 'Playfair Display', serif;
-            font-size: 1.6rem;
-            font-weight: 700;
-            margin-bottom: 24px;
-        }
-        .menu-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-            gap: 16px;
-        }
-        .menu-card {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            overflow: hidden;
-            transition: all 0.25s;
-            position: relative;
-        }
-        .menu-card:hover {
-            border-color: var(--accent);
-            transform: translateY(-4px);
-            box-shadow: 0 20px 40px -12px rgba(249,115,22,0.2);
-        }
-        .menu-card.out-of-stock { opacity: 0.5; pointer-events: none; }
-        .card-img-wrap {
-            width: 100%;
-            height: 130px;
-            overflow: hidden;
-            background: var(--surface2);
-            position: relative;
-        }
-        .card-img-wrap img { width: 100%; height: 100%; object-fit: cover; transition: transform 0.4s; }
-        .menu-card:hover .card-img-wrap img { transform: scale(1.06); }
-        .card-placeholder {
-            width: 100%;
-            height: 100%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 2.5rem;
-            background: linear-gradient(135deg, #1f1f1f, #2a2a2a);
-        }
-        .out-badge {
-            position: absolute;
-            top: 8px; left: 8px;
-            background: var(--danger);
-            color: white;
-            font-size: 0.6rem;
-            font-weight: 700;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-            padding: 3px 8px;
-            border-radius: 40px;
-        }
-        .card-body { padding: 12px 14px 14px; }
-        .card-name {
-            font-weight: 600;
-            font-size: 0.9rem;
-            margin-bottom: 4px;
-            color: var(--text);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        .card-price {
-            font-family: 'Playfair Display', serif;
-            font-size: 1.2rem;
-            font-weight: 700;
-            color: var(--accent);
-            margin-bottom: 6px;
-        }
-        .card-stock { font-size: 0.7rem; color: var(--text3); margin-bottom: 10px; }
-        .card-stock.low { color: var(--gold); }
-        .add-row { display: flex; gap: 6px; align-items: center; }
-        .qty-input {
-            width: 52px;
-            background: var(--surface2);
-            border: 1px solid var(--border);
-            color: var(--text);
-            padding: 7px 8px;
-            border-radius: 10px;
-            text-align: center;
-            font-family: 'DM Sans', sans-serif;
-            font-size: 0.85rem;
-        }
-        .qty-input:focus { outline: none; border-color: var(--accent); }
-        .btn-add {
-            flex: 1;
-            background: var(--accent);
-            color: white;
-            border: none;
-            padding: 8px 10px;
-            border-radius: 10px;
-            font-family: 'DM Sans', sans-serif;
-            font-weight: 600;
-            font-size: 0.8rem;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-        .btn-add:hover { background: var(--accent2); }
+.menu-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:14px; }
+.menu-card {
+    background:var(--surface); border:1px solid var(--border);
+    border-radius:var(--radius); overflow:hidden; transition:all 0.22s; position:relative;
+}
+.menu-card:hover { border-color:var(--accent); transform:translateY(-4px); box-shadow:0 20px 40px -12px rgba(249,115,22,0.18); }
+.menu-card.out-of-stock { opacity:0.45; pointer-events:none; }
+.card-img-wrap { width:100%; height:120px; overflow:hidden; background:var(--surface2); position:relative; }
+.card-img-wrap img { width:100%; height:100%; object-fit:cover; transition:transform 0.4s; }
+.menu-card:hover .card-img-wrap img { transform:scale(1.07); }
+.card-placeholder {
+    width:100%; height:100%; display:flex; align-items:center; justify-content:center;
+    font-size:2.2rem; background:linear-gradient(135deg,#1f1f1f,#2a2a2a);
+}
+.out-badge {
+    position:absolute; top:8px; left:8px;
+    background:var(--danger); color:white;
+    font-size:0.58rem; font-weight:700; letter-spacing:1px; text-transform:uppercase;
+    padding:3px 8px; border-radius:40px;
+}
+.card-body { padding:11px 13px 13px; }
+.card-name { font-weight:600; font-size:0.87rem; margin-bottom:3px; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.card-price { font-family:'Playfair Display',serif; font-size:1.15rem; font-weight:700; color:var(--accent); margin-bottom:5px; }
+.card-stock { font-size:0.68rem; color:var(--text3); margin-bottom:9px; }
+.card-stock.low { color:var(--gold); }
 
-        .cart-sidebar {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 24px;
-            overflow: hidden;
-            position: sticky;
-            top: 80px;
-        }
-        .cart-header {
-            padding: 20px 22px 16px;
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-        .cart-header-left h2 { font-family: 'Playfair Display', serif; font-size: 1.2rem; }
-        .cart-header-left p { font-size: 0.75rem; color: var(--text2); margin-top: 2px; }
-        .cart-count-badge {
-            background: var(--accent);
-            color: white;
-            border-radius: 50%;
-            width: 28px; height: 28px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: 700;
-            font-size: 0.8rem;
-        }
-        .cart-items { padding: 16px 22px; max-height: 320px; overflow-y: auto; }
-        .cart-items::-webkit-scrollbar { width: 4px; }
-        .cart-items::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-        .cart-empty { text-align: center; color: var(--text3); padding: 32px 0; font-size: 0.85rem; }
-        .cart-empty .empty-icon { font-size: 2.5rem; margin-bottom: 8px; }
-        .cart-row {
-            display: flex;
-            align-items: flex-start;
-            gap: 12px;
-            padding: 10px 0;
-            border-bottom: 1px solid var(--border);
-            animation: fadeIn 0.2s ease;
-        }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
-        .cart-row:last-child { border-bottom: none; }
-        .cart-row-info { flex: 1; min-width: 0; }
-        .cart-row-name { font-size: 0.85rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .cart-row-detail { font-size: 0.75rem; color: var(--text2); margin-top: 2px; }
-        .cart-row-subtotal { font-size: 0.85rem; font-weight: 700; color: var(--accent); white-space: nowrap; }
-        .btn-remove {
-            background: none;
-            border: none;
-            color: var(--text3);
-            cursor: pointer;
-            font-size: 1rem;
-            padding: 2px 4px;
-            transition: color 0.15s;
-            text-decoration: none;
-        }
-        .btn-remove:hover { color: var(--danger); }
-        .cart-footer { padding: 16px 22px; border-top: 1px solid var(--border); }
-        .total-line {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 16px;
-        }
-        .total-label { font-size: 0.8rem; color: var(--text2); text-transform: uppercase; letter-spacing: 1px; }
-        .total-amount {
-            font-family: 'Playfair Display', serif;
-            font-size: 1.6rem;
-            font-weight: 700;
-            color: var(--accent);
-        }
-        .btn-checkout {
-            width: 100%;
-            background: linear-gradient(135deg, var(--accent), #ea580c);
-            color: white;
-            border: none;
-            padding: 14px;
-            border-radius: 14px;
-            font-family: 'DM Sans', sans-serif;
-            font-weight: 700;
-            font-size: 0.95rem;
-            cursor: pointer;
-            transition: all 0.2s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-        }
-        .btn-checkout:hover { transform: scale(0.98); box-shadow: 0 8px 20px rgba(249,115,22,0.3); }
-        .error-msg {
-            background: rgba(239,68,68,0.1);
-            border: 1px solid rgba(239,68,68,0.3);
-            color: #fca5a5;
-            padding: 10px 14px;
-            border-radius: 10px;
-            font-size: 0.8rem;
-            margin-top: 10px;
-        }
+.qty-row {
+    display:flex; align-items:center; justify-content:center; gap:6px;
+    margin-top:5px;
+}
+.qty-btn {
+    width:32px; height:32px; border:1px solid var(--border);
+    background:var(--surface2); color:var(--text); border-radius:8px;
+    cursor:pointer; font-size:1.1rem; font-weight:700; transition:all 0.15s;
+    display:flex; align-items:center; justify-content:center;
+}
+.qty-btn:hover { border-color:var(--accent); color:var(--accent); background:rgba(249,115,22,0.08); }
+.qty-display {
+    width:40px; height:32px;
+    background:var(--surface2); border:1px solid var(--border);
+    color:var(--text); text-align:center;
+    font-family:'DM Sans',sans-serif; font-size:0.9rem; font-weight:600;
+    display:flex; align-items:center; justify-content:center;
+    border-radius:8px;
+}
 
-        .success-wrap { max-width: 520px; margin: 60px auto; padding: 0 20px; text-align: center; }
-        .success-card {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 28px;
-            padding: 40px 32px;
-        }
-        .success-icon {
-            width: 64px; height: 64px;
-            background: rgba(34,197,94,0.15);
-            border: 2px solid var(--success);
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1.8rem;
-            margin: 0 auto 20px;
-        }
-        .success-card h2 { font-family: 'Playfair Display', serif; font-size: 1.8rem; margin-bottom: 8px; }
-        .success-card p { color: var(--text2); font-size: 0.9rem; margin-bottom: 6px; }
-        .order-code-badge {
-            display: inline-block;
-            background: rgba(249,115,22,0.1);
-            border: 1px solid rgba(249,115,22,0.3);
-            color: var(--accent);
-            font-weight: 700;
-            padding: 6px 18px;
-            border-radius: 40px;
-            margin: 12px 0 28px;
-            letter-spacing: 1px;
-        }
-        .qr-wrap {
-            background: white;
-            border-radius: 16px;
-            padding: 16px;
-            display: inline-block;
-            margin-bottom: 24px;
-        }
-        .qr-wrap img { display: block; border-radius: 8px; }
-        .qr-hint { font-size: 0.75rem; color: var(--text3); margin-bottom: 24px; }
-        .btn-new-order {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            background: var(--accent);
-            color: white;
-            padding: 12px 28px;
-            border-radius: 40px;
-            text-decoration: none;
-            font-weight: 700;
-            font-size: 0.9rem;
-            transition: all 0.2s;
-        }
-        .btn-new-order:hover { background: var(--accent2); transform: scale(0.97); }
+.cart-sidebar {
+    background:var(--surface); border:1px solid var(--border);
+    border-radius:24px; overflow:hidden; position:sticky; top:80px;
+}
+.cart-header {
+    padding:18px 20px 14px; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; justify-content:space-between;
+}
+.cart-header-left h2 { font-family:'Playfair Display',serif; font-size:1.15rem; }
+.cart-header-left p { font-size:0.73rem; color:var(--text2); margin-top:2px; }
+.cart-count-badge {
+    background:var(--accent); color:white; border-radius:50%;
+    width:26px; height:26px; display:flex; align-items:center; justify-content:center;
+    font-weight:700; font-size:0.78rem;
+}
+.cart-items { padding:14px 20px; max-height:340px; overflow-y:auto; }
+.cart-items::-webkit-scrollbar { width:4px; }
+.cart-items::-webkit-scrollbar-thumb { background:var(--border); border-radius:4px; }
+.cart-empty { text-align:center; color:var(--text3); padding:28px 0; font-size:0.83rem; }
+.cart-empty .empty-icon { font-size:2.2rem; margin-bottom:7px; }
+.cart-row {
+    display:flex; align-items:center; gap:10px;
+    padding:9px 0; border-bottom:1px solid var(--border);
+    animation:fadeIn 0.2s ease;
+}
+@keyframes fadeIn { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:translateY(0); } }
+.cart-row:last-child { border-bottom:none; }
+.cart-row-info { flex:1; min-width:0; }
+.cart-row-name { font-size:0.83rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cart-row-detail { font-size:0.72rem; color:var(--text2); margin-top:1px; }
 
-        .orders-wrap { max-width: 1320px; margin: 0 auto 40px; padding: 0 20px; }
-        .table-card {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 24px;
-            overflow: hidden;
-        }
-        .table-card-header {
-            padding: 20px 24px;
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-        .table-card-header h2 { font-family: 'Playfair Display', serif; font-size: 1.2rem; }
-        .table-card-header span { font-size: 0.75rem; color: var(--text2); }
-        .orders-table { width: 100%; border-collapse: collapse; }
-        .orders-table thead th {
-            padding: 12px 18px;
-            text-align: left;
-            font-size: 0.68rem;
-            letter-spacing: 2px;
-            text-transform: uppercase;
-            color: var(--text3);
-            background: var(--surface);
-            border-bottom: 1px solid var(--border);
-        }
-        .orders-table tbody td {
-            padding: 14px 18px;
-            font-size: 0.85rem;
-            border-bottom: 1px solid rgba(42,42,42,0.5);
-            vertical-align: middle;
-        }
-        .orders-table tbody tr:last-child td { border-bottom: none; }
-        .orders-table tbody tr:hover td { background: var(--surface2); }
-        .status-badge {
-            display: inline-block;
-            padding: 3px 10px;
-            border-radius: 40px;
-            font-size: 0.7rem;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        .status-pending { background: rgba(245,158,11,0.15); color: var(--gold); border: 1px solid rgba(245,158,11,0.3); }
-        .status-done { background: rgba(34,197,94,0.1); color: var(--success); border: 1px solid rgba(34,197,94,0.25); }
-        .order-amount { color: var(--accent); font-weight: 700; font-family: 'Playfair Display', serif; }
-        .qr-mini { width: 48px; height: 48px; border-radius: 6px; background: white; padding: 2px; }
-        .empty-table { text-align: center; color: var(--text3); padding: 40px; font-size: 0.85rem; }
+.cart-qty-ctrl { display:flex; align-items:center; gap:5px; flex-shrink:0; }
+.cqty-btn {
+    width:26px; height:26px; border:1px solid var(--border);
+    background:var(--surface2); color:var(--text); border-radius:6px;
+    cursor:pointer; font-size:0.9rem; font-weight:700;
+    display:flex; align-items:center; justify-content:center;
+    transition:all 0.15s;
+}
+.cqty-btn:hover { border-color:var(--accent); color:var(--accent); }
+.cqty-num { font-size:0.85rem; font-weight:700; padding:0 5px; color:var(--text); min-width:24px; text-align:center; }
+.cart-row-subtotal { font-size:0.83rem; font-weight:700; color:var(--accent); white-space:nowrap; min-width:52px; text-align:right; }
+.btn-remove {
+    background:none; border:none; color:var(--text3);
+    cursor:pointer; font-size:1rem; padding:2px 3px;
+    transition:color 0.15s;
+}
+.btn-remove:hover { color:var(--danger); }
 
-        @media (max-width: 900px) {
-            .main-wrap { grid-template-columns: 1fr; }
-            .cart-sidebar { position: static; }
-        }
-        @media (max-width: 500px) {
-            .menu-grid { grid-template-columns: repeat(2, 1fr); }
-            .hero { padding: 40px 16px 32px; }
-            .main-wrap { padding: 20px 12px; }
-            .orders-wrap { padding: 0 12px; }
-        }
-    </style>
+.cart-footer { padding:14px 20px; border-top:1px solid var(--border); }
+.total-line { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
+.total-label { font-size:0.78rem; color:var(--text2); text-transform:uppercase; letter-spacing:1px; }
+.total-amount { font-family:'Playfair Display',serif; font-size:1.5rem; font-weight:700; color:var(--accent); }
+.btn-checkout {
+    width:100%;
+    background:linear-gradient(135deg,var(--accent),#ea580c);
+    color:white; border:none; padding:13px; border-radius:13px;
+    font-family:'DM Sans',sans-serif; font-weight:700; font-size:0.93rem;
+    cursor:pointer; transition:all 0.2s;
+    display:flex; align-items:center; justify-content:center; gap:7px;
+}
+.btn-checkout:hover { transform:scale(0.98); box-shadow:0 8px 20px rgba(249,115,22,0.28); }
+.error-msg {
+    background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.28);
+    color:#fca5a5; padding:9px 13px; border-radius:9px;
+    font-size:0.78rem; margin-top:9px;
+}
+
+.success-wrap { max-width:520px; margin:50px auto; padding:0 20px; text-align:center; }
+.success-card {
+    background:var(--surface); border:1px solid var(--border);
+    border-radius:28px; padding:36px 28px;
+}
+.success-icon {
+    width:60px; height:60px;
+    background:rgba(34,197,94,0.13); border:2px solid var(--success);
+    border-radius:50%; display:flex; align-items:center; justify-content:center;
+    font-size:1.6rem; margin:0 auto 18px;
+}
+.success-card h2 { font-family:'Playfair Display',serif; font-size:1.7rem; margin-bottom:7px; }
+.success-card p { color:var(--text2); font-size:0.88rem; margin-bottom:5px; }
+.order-code-badge {
+    display:inline-block;
+    background:rgba(249,115,22,0.1); border:1px solid rgba(249,115,22,0.3);
+    color:var(--accent); font-weight:700; padding:5px 16px;
+    border-radius:40px; margin:10px 0 22px; letter-spacing:1px;
+}
+.qr-wrap { background:white; border-radius:14px; padding:14px; display:inline-block; margin-bottom:20px; }
+.qr-wrap img { display:block; border-radius:7px; }
+.qr-hint { font-size:0.73rem; color:var(--text3); margin-bottom:22px; }
+.btn-new-order {
+    display:inline-flex; align-items:center; gap:7px;
+    background:var(--accent); color:white; padding:11px 26px;
+    border-radius:40px; text-decoration:none; font-weight:700; font-size:0.88rem;
+    transition:all 0.2s;
+}
+.btn-new-order:hover { background:var(--accent2); transform:scale(0.97); }
+
+.queue-section {
+    max-width:1400px; margin:0 auto 40px; padding:0 20px;
+}
+.queue-title-row {
+    display:flex; align-items:center; gap:10px; margin-bottom:20px;
+}
+.queue-title-row .section-label { margin-bottom:0; }
+.live-dot {
+    width:8px; height:8px; border-radius:50%; background:var(--success);
+    box-shadow:0 0 0 0 rgba(34,197,94,0.5);
+    animation:pulse-dot 1.6s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+    0%,100% { box-shadow:0 0 0 0 rgba(34,197,94,0.5); }
+    50% { box-shadow:0 0 0 6px rgba(34,197,94,0); }
+}
+.queue-grid {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:20px;
+}
+.queue-panel {
+    background:var(--surface); border:1px solid var(--border);
+    border-radius:22px; overflow:hidden;
+}
+.queue-panel-header {
+    padding:16px 20px 12px;
+    border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:10px;
+}
+.queue-panel-header .panel-icon { font-size:1.2rem; }
+.queue-panel-header h3 { font-family:'Playfair Display',serif; font-size:1rem; font-weight:700; }
+.queue-panel-header .panel-count {
+    margin-left:auto;
+    font-size:0.72rem; color:var(--text3);
+}
+.queue-list { padding:12px 16px; min-height:80px; max-height:280px; overflow-y:auto; }
+.queue-list::-webkit-scrollbar { width:3px; }
+.queue-list::-webkit-scrollbar-thumb { background:var(--border); }
+.queue-item {
+    display:flex; align-items:center; gap:12px;
+    padding:10px 14px; border-radius:12px;
+    margin-bottom:8px; transition:all 0.2s;
+    border:1.5px solid transparent;
+}
+.queue-item.s-pending { background:var(--pending-bg); }
+.queue-item.s-pending .q-code { color:var(--pending-color); }
+.queue-item.s-waiting { background:var(--waiting-bg); }
+.queue-item.s-waiting .q-code { color:var(--waiting-color); }
+.queue-item.s-serving { background:var(--serving-bg); }
+.queue-item.s-serving .q-code { color:var(--serving-color); }
+.queue-item.s-done { background:var(--done-bg); }
+.queue-item.s-done .q-code { color:var(--done-color); }
+.queue-item.my-order {
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 1px var(--accent), 0 4px 20px rgba(249,115,22,0.22);
+    background: rgba(249,115,22,0.1) !important;
+}
+.queue-item.my-order .q-code { color:var(--accent) !important; }
+.my-tag {
+    background:var(--accent); color:white;
+    font-size:0.58rem; font-weight:700; letter-spacing:1px;
+    text-transform:uppercase; padding:2px 7px; border-radius:40px;
+    animation:pulse-tag 2s ease-in-out infinite;
+}
+@keyframes pulse-tag {
+    0%,100% { opacity:1; }
+    50% { opacity:0.65; }
+}
+.q-num { font-size:0.7rem; color:var(--text3); font-weight:500; min-width:18px; }
+.q-code { font-family:'Courier New',monospace; font-size:1rem; font-weight:700; }
+.q-time { font-size:0.68rem; color:var(--text3); margin-left:auto; }
+.queue-empty {
+    display:flex; flex-direction:column; align-items:center;
+    justify-content:center; padding:28px 0;
+    color:var(--text3); font-size:0.82rem;
+}
+.queue-empty .eq-icon { font-size:1.8rem; margin-bottom:6px; }
+.my-status-card {
+    margin-top:20px;
+    background:var(--surface2); border:1.5px solid var(--accent);
+    border-radius:16px; padding:16px 20px;
+    text-align:left;
+}
+.my-status-card .ms-label { font-size:0.68rem; letter-spacing:2px; text-transform:uppercase; color:var(--accent); margin-bottom:6px; }
+.my-status-card .ms-status {
+    font-family:'Playfair Display',serif; font-size:1.4rem; font-weight:700;
+    margin-bottom:4px;
+}
+.my-status-card .ms-pos { font-size:0.82rem; color:var(--text2); }
+.status-pending .ms-status { color:var(--pending-color); }
+.status-waiting .ms-status { color:var(--waiting-color); }
+.status-serving .ms-status { color:var(--serving-color); }
+.status-done .ms-status { color:var(--done-color); }
+.refresh-bar {
+    font-size:0.68rem; color:var(--text3);
+    display:flex; align-items:center; gap:6px;
+    margin-bottom:14px;
+}
+.refresh-bar .live-dot { width:6px; height:6px; }
+@media (max-width:900px) {
+    .main-wrap { grid-template-columns:1fr; }
+    .cart-sidebar { position:static; }
+    .queue-grid { grid-template-columns:1fr; }
+}
+@media (max-width:500px) {
+    .menu-grid { grid-template-columns:repeat(2,1fr); }
+    .hero { padding:36px 14px 28px; }
+    .main-wrap,.queue-section { padding:16px 12px; }
+}
+</style>
 </head>
 <body>
 
@@ -619,12 +506,11 @@ foreach ($_SESSION['cart'] as $item) {
         <span class="brand-name">Snack in Save</span>
         <span class="brand-sub">9Nueve</span>
     </div>
-    <div class="nav-right">
+    <div>
         <?php if (!isset($_GET['success'])): ?>
         <button class="cart-pill" onclick="document.querySelector('.cart-sidebar').scrollIntoView({behavior:'smooth'})">
-            <span class="cart-icon"></span>
             Your Order
-            <span class="badge"><?php echo $cart_count; ?></span>
+            <span class="badge" id="cart-badge"><?php echo $cart_count; ?></span>
         </button>
         <?php endif; ?>
     </div>
@@ -637,7 +523,18 @@ foreach ($_SESSION['cart'] as $item) {
 </div>
 
 <?php if (isset($_GET['success']) && $_GET['success'] == 1 && isset($_GET['order_code'])):
-    $order_code = $_GET['order_code'];
+    $show_code = $_GET['order_code'];
+    $stmt_ss = $conn->prepare("SELECT id, status FROM orders WHERE order_code = ?");
+    $stmt_ss->bind_param("s", $show_code);
+    $stmt_ss->execute();
+    $ss_row = $stmt_ss->get_result()->fetch_assoc();
+    $ss_status = $ss_row ? $ss_row['status'] : 'pending';
+    $ss_id = $ss_row ? $ss_row['id'] : 0;
+    $stmt_spos = $conn->prepare("SELECT COUNT(*) AS pos FROM orders WHERE status IN ('pending','waiting') AND id <= ?");
+    $stmt_spos->bind_param("i", $ss_id);
+    $stmt_spos->execute();
+    $spos_row = $stmt_spos->get_result()->fetch_assoc();
+    $ss_pos = (int)$spos_row['pos'];
 ?>
 <div class="success-wrap">
     <div class="success-card">
@@ -645,69 +542,137 @@ foreach ($_SESSION['cart'] as $item) {
         <h2>Order Placed!</h2>
         <p>Your order has been received.</p>
         <p>Show this QR code to our staff.</p>
-        <div class="order-code-badge"><?php echo htmlspecialchars($order_code); ?></div>
-        <br>
+        <div class="order-code-badge"><?php echo htmlspecialchars($show_code); ?></div><br>
         <div class="qr-wrap">
             <?php
-            $qr_file = "qr_codes/" . $order_code . ".png";
+            $qr_file = "qr_codes/" . $show_code . ".png";
             if (file_exists($qr_file)) {
                 $qr_img_src = htmlspecialchars($qr_file);
             } else {
-                $qr_data_fallback = "http://" . $_SERVER['HTTP_HOST'] . dirname($_SERVER['SCRIPT_NAME']) . "/staff_scan.php?code=" . $order_code;
-                $qr_img_src = "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" . urlencode($qr_data_fallback);
+                $qr_fallback = "http://" . $_SERVER['HTTP_HOST'] . dirname($_SERVER['SCRIPT_NAME']) . "/staff_scan.php?code=" . $show_code;
+                $qr_img_src = "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" . urlencode($qr_fallback);
             }
             ?>
             <img src="<?php echo $qr_img_src; ?>" width="180" height="180" alt="QR Code">
         </div>
-        <div class="qr-hint">📱 Scan this QR code at the counter</div>
-        <a href="index.php" class="btn-new-order">+ New Order</a>
+        <div class="qr-hint">Scan this QR code at the counter</div>
+        <div class="my-status-card status-<?php echo htmlspecialchars($ss_status); ?>" id="my-status-card">
+            <div class="ms-label">Order Status</div>
+            <div class="ms-status" id="ms-status-text">
+                <?php
+                $labels = ['pending'=>'Waiting for staff','waiting'=>'Preparing','serving'=>'Ready to Claim!','done'=>'Completed'];
+                echo $labels[$ss_status] ?? ucfirst($ss_status);
+                ?>
+            </div>
+            <div class="ms-pos" id="ms-pos-text">
+                <?php if (in_array($ss_status, ['pending','waiting'])): ?>
+                    #<?php echo $ss_pos; ?> in queue
+                <?php elseif ($ss_status === 'serving'): ?>
+                    Please proceed to the counter
+                <?php else: ?>
+                    Thank you!
+                <?php endif; ?>
+            </div>
+        </div>
+        <br>
+        <a href="index.php" class="btn-new-order">New Order</a>
     </div>
 </div>
-
+<script>
+const myCode = <?php echo json_encode($show_code); ?>;
+function refreshStatus() {
+    fetch('order_status.php?code=' + encodeURIComponent(myCode))
+        .then(r => r.json())
+        .then(d => {
+            const labels = {
+                pending: 'Waiting for staff',
+                waiting: 'Preparing',
+                serving: 'Ready to Claim!',
+                done: 'Completed'
+            };
+            const card = document.getElementById('my-status-card');
+            card.className = 'my-status-card status-' + d.status;
+            document.getElementById('ms-status-text').textContent = labels[d.status] || d.status;
+            const posEl = document.getElementById('ms-pos-text');
+            if (d.status === 'pending' || d.status === 'waiting') {
+                posEl.textContent = '#' + d.position + ' in queue';
+            } else if (d.status === 'serving') {
+                posEl.textContent = 'Please proceed to the counter';
+            } else {
+                posEl.textContent = 'Thank you!';
+            }
+        }).catch(() => {});
+}
+setInterval(refreshStatus, 5000);
+</script>
 <?php else: ?>
 
 <div class="main-wrap">
     <div>
         <div class="section-label">What we serve</div>
         <div class="section-title">Menu</div>
-        <div class="menu-grid">
-            <?php
+        <?php if (!empty($categories)): ?>
+        <div class="cat-filter">
+            <a href="index.php" class="cat-btn <?php echo $selected_cat === '' ? 'active' : ''; ?>">All</a>
+            <?php foreach ($categories as $cat): ?>
+            <a href="index.php?cat=<?php echo urlencode($cat); ?>" class="cat-btn <?php echo $selected_cat === $cat ? 'active' : ''; ?>">
+                <?php echo htmlspecialchars($cat); ?>
+            </a>
+            <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+
+        <div class="menu-grid" id="menu-grid">
+        <?php
+        if ($selected_cat !== '') {
+            $stmt_m = $conn->prepare("
+                SELECT m.id, m.name, m.price, m.image_path, m.stock 
+                FROM menu m 
+                INNER JOIN categories c ON m.category_id = c.id 
+                WHERE c.name = ? 
+                ORDER BY m.name
+            ");
+            $stmt_m->bind_param("s", $selected_cat);
+            $stmt_m->execute();
+            $result = $stmt_m->get_result();
+        } else {
             $result = $conn->query("SELECT id, name, price, image_path, stock FROM menu ORDER BY name");
-            if ($result && $result->num_rows > 0):
-                while ($row = $result->fetch_assoc()):
-                    $img_src = getImageSrc($row['image_path']);
-                    $is_out = (int)$row['stock'] === 0;
-                    $is_low = (int)$row['stock'] <= 3 && !$is_out;
-            ?>
-            <div class="menu-card <?php echo $is_out ? 'out-of-stock' : ''; ?>">
-                <div class="card-img-wrap">
-                    <?php if ($img_src): ?>
-                        <img src="<?php echo $img_src; ?>" alt="<?php echo htmlspecialchars($row['name']); ?>">
-                    <?php else: ?>
-                        <div class="card-placeholder"></div>
-                    <?php endif; ?>
-                    <?php if ($is_out): ?><span class="out-badge">Sold Out</span><?php endif; ?>
-                </div>
-                <div class="card-body">
-                    <div class="card-name"><?php echo htmlspecialchars($row['name']); ?></div>
-                    <div class="card-price">₱<?php echo number_format($row['price'], 2); ?></div>
-                    <div class="card-stock <?php echo $is_low ? 'low' : ''; ?>">
-                        <?php echo $is_low ? '⚠ ' : ''; ?>
-                        Stock: <?php echo (int)$row['stock']; ?>
-                    </div>
-                    <?php if (!$is_out): ?>
-                    <form method="post" class="add-row">
-                        <input type="hidden" name="menu_id" value="<?php echo $row['id']; ?>">
-                        <input type="number" name="quantity" class="qty-input" value="1" min="1" max="<?php echo (int)$row['stock']; ?>">
-                        <button type="submit" name="add_to_cart" class="btn-add">+ Add</button>
-                    </form>
-                    <?php endif; ?>
-                </div>
+        }
+        if ($result && $result->num_rows > 0):
+            while ($row = $result->fetch_assoc()):
+                $img_src  = getImageSrc($row['image_path']);
+                $is_out   = (int)$row['stock'] === 0;
+                $is_low   = (int)$row['stock'] <= 3 && !$is_out;
+                $current_qty = isset($_SESSION['cart'][$row['id']]) ? $_SESSION['cart'][$row['id']]['quantity'] : 0;
+        ?>
+        <div class="menu-card <?php echo $is_out ? 'out-of-stock' : ''; ?>" data-id="<?php echo $row['id']; ?>" data-name="<?php echo htmlspecialchars($row['name']); ?>" data-price="<?php echo $row['price']; ?>" data-stock="<?php echo (int)$row['stock']; ?>">
+            <div class="card-img-wrap">
+                <?php if ($img_src): ?>
+                    <img src="<?php echo $img_src; ?>" alt="<?php echo htmlspecialchars($row['name']); ?>">
+                <?php else: ?>
+                    <div class="card-placeholder"></div>
+                <?php endif; ?>
+                <?php if ($is_out): ?><span class="out-badge">Sold Out</span><?php endif; ?>
             </div>
-            <?php endwhile;
-            else: ?>
-                <div style="color:var(--text2);padding:32px 0;">No items available right now.</div>
-            <?php endif; ?>
+            <div class="card-body">
+                <div class="card-name"><?php echo htmlspecialchars($row['name']); ?></div>
+                <div class="card-price">₱<?php echo number_format($row['price'], 2); ?></div>
+                <div class="card-stock <?php echo $is_low ? 'low' : ''; ?>">
+                    <?php echo $is_low ? '⚠ ' : ''; ?>Stock: <?php echo (int)$row['stock']; ?>
+                </div>
+                <?php if (!$is_out): ?>
+                <div class="qty-row">
+                    <button class="qty-btn minus-btn" data-id="<?php echo $row['id']; ?>">-</button>
+                    <span class="qty-display" id="qty-<?php echo $row['id']; ?>"><?php echo $current_qty; ?></span>
+                    <button class="qty-btn plus-btn" data-id="<?php echo $row['id']; ?>">+</button>
+                </div>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php endwhile;
+        else: ?>
+            <div style="color:var(--text2);padding:28px 0;grid-column:1/-1;">No items available right now.</div>
+        <?php endif; ?>
         </div>
     </div>
 
@@ -716,43 +681,47 @@ foreach ($_SESSION['cart'] as $item) {
             <div class="cart-header">
                 <div class="cart-header-left">
                     <h2>Your Order</h2>
-                    <p><?php echo $cart_count; ?> item<?php echo $cart_count !== 1 ? 's' : ''; ?> selected</p>
+                    <p id="cart-item-count"><?php echo $cart_count; ?> item<?php echo $cart_count !== 1 ? 's' : ''; ?> selected</p>
                 </div>
-                <div class="cart-count-badge"><?php echo $cart_count; ?></div>
+                <div class="cart-count-badge" id="cart-badge-side"><?php echo $cart_count; ?></div>
             </div>
-            <div class="cart-items">
+            <div class="cart-items" id="cart-items-container">
                 <?php if (empty($_SESSION['cart'])): ?>
-                <div class="cart-empty">
-                    <div class="empty-icon">🧺</div>
+                <div class="cart-empty" id="cart-empty-msg">
+                    <div class="empty-icon"></div>
                     <div>Your cart is empty</div>
-                    <div style="font-size:0.75rem;margin-top:4px;">Add items from the menu</div>
+                    <div style="font-size:0.73rem;margin-top:3px;">Use + / - on menu items</div>
                 </div>
-                <?php else:
-                    foreach ($_SESSION['cart'] as $id => $item):
-                        $subtotal = $item['price'] * $item['quantity'];
-                ?>
-                <div class="cart-row">
-                    <div class="cart-row-info">
-                        <div class="cart-row-name"><?php echo htmlspecialchars($item['name']); ?></div>
-                        <div class="cart-row-detail">₱<?php echo number_format($item['price'], 2); ?> × <?php echo $item['quantity']; ?></div>
+                <?php else: ?>
+                <div id="cart-list">
+                    <?php foreach ($_SESSION['cart'] as $id => $item): ?>
+                    <div class="cart-row" data-id="<?php echo $id; ?>">
+                        <div class="cart-row-info">
+                            <div class="cart-row-name"><?php echo htmlspecialchars($item['name']); ?></div>
+                            <div class="cart-row-detail">₱<?php echo number_format($item['price'], 2); ?> each</div>
+                        </div>
+                        <div class="cart-qty-ctrl">
+                            <button class="cqty-btn cart-minus" data-id="<?php echo $id; ?>">-</button>
+                            <span class="cqty-num" id="cart-qty-<?php echo $id; ?>"><?php echo $item['quantity']; ?></span>
+                            <button class="cqty-btn cart-plus" data-id="<?php echo $id; ?>">+</button>
+                        </div>
+                        <div class="cart-row-subtotal" id="cart-subtotal-<?php echo $id; ?>">₱<?php echo number_format($item['price'] * $item['quantity'], 2); ?></div>
+                        <button class="btn-remove cart-remove" data-id="<?php echo $id; ?>">X</button>
                     </div>
-                    <div class="cart-row-subtotal">₱<?php echo number_format($subtotal, 2); ?></div>
-                    <a href="?remove=<?php echo $id; ?>" class="btn-remove" title="Remove">✕</a>
+                    <?php endforeach; ?>
                 </div>
-                <?php endforeach; endif; ?>
+                <?php endif; ?>
             </div>
             <div class="cart-footer">
                 <div class="total-line">
                     <span class="total-label">Total</span>
-                    <span class="total-amount">₱<?php echo number_format($cart_total, 2); ?></span>
+                    <span class="total-amount" id="cart-total-amount">₱<?php echo number_format($cart_total, 2); ?></span>
                 </div>
-                <?php if (!empty($_SESSION['cart'])): ?>
-                <form method="post">
-                    <button type="submit" name="checkout" class="btn-checkout">
-                        🧾 Place Order & Get QR
+                <form method="post" id="checkout-form">
+                    <button type="submit" name="checkout" class="btn-checkout" id="place-order-btn" <?php echo empty($_SESSION['cart']) ? 'disabled style="opacity:0.5;"' : ''; ?>>
+                        Place Order & Get QR
                     </button>
                 </form>
-                <?php endif; ?>
                 <?php if (isset($error)): ?>
                 <div class="error-msg">⚠ <?php echo htmlspecialchars($error); ?></div>
                 <?php endif; ?>
@@ -762,71 +731,251 @@ foreach ($_SESSION['cart'] as $item) {
 </div>
 
 <?php
-$orders_result = $conn->query("
-    SELECT o.id, o.order_code, o.total_amount, o.created_at,
-           GROUP_CONCAT(m.name ORDER BY m.name SEPARATOR ', ') AS items,
-           o.status
-    FROM orders o
-    LEFT JOIN order_items oi ON oi.order_id = o.id
-    LEFT JOIN menu m ON m.id = oi.menu_id
-    GROUP BY o.id
-    ORDER BY o.created_at DESC
-    LIMIT 20
-");
+$q_prep = $conn->query("SELECT order_code, created_at FROM orders WHERE status = 'waiting' ORDER BY created_at ASC LIMIT 30");
+$prep_list = [];
+while ($r = $q_prep->fetch_assoc()) $prep_list[] = $r;
+$q_serv = $conn->query("SELECT order_code, created_at FROM orders WHERE status = 'serving' ORDER BY created_at ASC LIMIT 10");
+$serv_list = [];
+while ($r = $q_serv->fetch_assoc()) $serv_list[] = $r;
+$my_code = $queue_order_code;
 ?>
-<div class="orders-wrap">
-    <div class="table-card">
-        <div class="table-card-header">
-            <h2>Recent Orders</h2>
-            <span>Last 20 orders</span>
-        </div>
-        <?php if ($orders_result && $orders_result->num_rows > 0): ?>
-        <div style="overflow-x:auto;">
-            <table class="orders-table">
-                <thead>
-                    <tr>
-                        <th>QR</th>
-                        <th>Order Code</th>
-                        <th>Items</th>
-                        <th>Total</th>
-                        <th>Status</th>
-                        <th>Date</th>
-                    </tr>
-                </thead>
-                <tbody>
-                <?php while ($ord = $orders_result->fetch_assoc()):
-                    $qr_file = "qr_codes/" . $ord['order_code'] . ".png";
-                    $status = isset($ord['status']) ? $ord['status'] : 'pending';
+<div class="queue-section" id="queue-section">
+    <div class="queue-title-row">
+        <div class="live-dot"></div>
+        <div class="section-label" style="margin-bottom:0;">Order Queue</div>
+    </div>
+
+    <div class="queue-grid" id="queue-grid">
+        <div class="queue-panel">
+            <div class="queue-panel-header">
+                <span class="panel-icon"></span>
+                <h3>Preparing</h3>
+                <span class="panel-count"><?php echo count($prep_list); ?> order<?php echo count($prep_list) !== 1 ? 's' : ''; ?></span>
+            </div>
+            <div class="queue-list">
+                <?php if (empty($prep_list)): ?>
+                <div class="queue-empty"><div class="eq-icon"></div>No orders in queue</div>
+                <?php else:
+                    foreach ($prep_list as $i => $ord):
+                        $is_mine = ($my_code && $ord['order_code'] === $my_code);
                 ?>
-                <tr>
-                    <td>
-                        <?php if (file_exists($qr_file)): ?>
-                        <img src="<?php echo htmlspecialchars($qr_file); ?>" class="qr-mini" alt="QR">
-                        <?php else: ?>
-                        <span style="color:var(--text3);font-size:0.75rem;">—</span>
-                        <?php endif; ?>
-                    </td>
-                    <td style="font-family:monospace;font-size:0.78rem;color:var(--accent);"><?php echo htmlspecialchars($ord['order_code']); ?></td>
-                    <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2);font-size:0.8rem;"><?php echo htmlspecialchars($ord['items'] ?? '—'); ?></td>
-                    <td class="order-amount">₱<?php echo number_format($ord['total_amount'], 2); ?></td>
-                    <td>
-                        <span class="status-badge status-<?php echo htmlspecialchars($status); ?>">
-                            <?php echo ucfirst(htmlspecialchars($status)); ?>
-                        </span>
-                    </td>
-                    <td style="color:var(--text2);font-size:0.78rem;"><?php echo date('M j, g:i A', strtotime($ord['created_at'])); ?></td>
-                </tr>
-                <?php endwhile; ?>
-                </tbody>
-            </table>
+                <div class="queue-item s-waiting <?php echo $is_mine ? 'my-order' : ''; ?>">
+                    <span class="q-num">#<?php echo $i+1; ?></span>
+                    <span class="q-code"><?php echo htmlspecialchars($ord['order_code']); ?></span>
+                    <?php if ($is_mine): ?><span class="my-tag">YOUR ORDER</span><?php endif; ?>
+                    <span class="q-time"><?php echo date('g:i A', strtotime($ord['created_at'])); ?></span>
+                </div>
+                <?php endforeach; endif; ?>
+            </div>
         </div>
-        <?php else: ?>
-        <div class="empty-table">No orders yet.</div>
-        <?php endif; ?>
+        <div class="queue-panel">
+            <div class="queue-panel-header">
+                <span class="panel-icon"></span>
+                <h3>Now Serving</h3>
+                <span class="panel-count"><?php echo count($serv_list); ?> order<?php echo count($serv_list) !== 1 ? 's' : ''; ?></span>
+            </div>
+            <div class="queue-list">
+                <?php if (empty($serv_list)): ?>
+                <div class="queue-empty"><div class="eq-icon"></div>No orders ready yet</div>
+                <?php else:
+                    foreach ($serv_list as $ord):
+                        $is_mine = ($my_code && $ord['order_code'] === $my_code);
+                ?>
+                <div class="queue-item s-serving <?php echo $is_mine ? 'my-order' : ''; ?>">
+                    <span class="q-code"><?php echo htmlspecialchars($ord['order_code']); ?></span>
+                    <?php if ($is_mine): ?><span class="my-tag">YOUR ORDER</span><?php endif; ?>
+                    <span class="q-time"><?php echo date('g:i A', strtotime($ord['created_at'])); ?></span>
+                </div>
+                <?php endforeach; endif; ?>
+            </div>
+        </div>
     </div>
 </div>
 
 <?php endif; ?>
+
+<script>
+function updateCartUI(cartData) {
+    const container = document.getElementById('cart-items-container');
+    const totalSpan = document.getElementById('cart-total-amount');
+    const badge = document.getElementById('cart-badge');
+    const badgeSide = document.getElementById('cart-badge-side');
+    const itemCountSpan = document.getElementById('cart-item-count');
+    const placeBtn = document.getElementById('place-order-btn');
+    
+    let total = 0;
+    let itemCount = 0;
+    
+    if (!cartData || Object.keys(cartData).length === 0) {
+        if (container) {
+            container.innerHTML = '<div class="cart-empty" id="cart-empty-msg"><div class="empty-icon"></div><div>Your cart is empty</div><div style="font-size:0.73rem;margin-top:3px;">Use + / - on menu items</div></div>';
+        }
+        if (badge) badge.textContent = '0';
+        if (badgeSide) badgeSide.textContent = '0';
+        if (itemCountSpan) itemCountSpan.textContent = '0 items selected';
+        if (totalSpan) totalSpan.textContent = '₱0.00';
+        if (placeBtn) { placeBtn.disabled = true; placeBtn.style.opacity = '0.5'; }
+        return;
+    }
+    
+    let html = '<div id="cart-list">';
+    for (const id in cartData) {
+        const item = cartData[id];
+        const subtotal = item.price * item.quantity;
+        total += subtotal;
+        itemCount += item.quantity;
+        html += `
+            <div class="cart-row" data-id="${id}">
+                <div class="cart-row-info">
+                    <div class="cart-row-name">${escapeHtml(item.name)}</div>
+                    <div class="cart-row-detail">₱${parseFloat(item.price).toFixed(2)} each</div>
+                </div>
+                <div class="cart-qty-ctrl">
+                    <button class="cqty-btn cart-minus" data-id="${id}">-</button>
+                    <span class="cqty-num" id="cart-qty-${id}">${item.quantity}</span>
+                    <button class="cqty-btn cart-plus" data-id="${id}">+</button>
+                </div>
+                <div class="cart-row-subtotal" id="cart-subtotal-${id}">₱${subtotal.toFixed(2)}</div>
+                <button class="btn-remove cart-remove" data-id="${id}">X</button>
+            </div>
+        `;
+    }
+    html += '</div>';
+    container.innerHTML = html;
+    
+    if (badge) badge.textContent = itemCount;
+    if (badgeSide) badgeSide.textContent = itemCount;
+    if (itemCountSpan) itemCountSpan.textContent = itemCount + ' item' + (itemCount !== 1 ? 's' : '') + ' selected';
+    if (totalSpan) totalSpan.textContent = '₱' + total.toFixed(2);
+    if (placeBtn) { placeBtn.disabled = false; placeBtn.style.opacity = '1'; }
+    
+    attachCartEvents();
+}
+
+function escapeHtml(str) {
+    return str.replace(/[&<>]/g, function(m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        return m;
+    });
+}
+
+function attachCartEvents() {
+    document.querySelectorAll('.cart-minus').forEach(btn => {
+        btn.removeEventListener('click', cartMinusHandler);
+        btn.addEventListener('click', cartMinusHandler);
+    });
+    document.querySelectorAll('.cart-plus').forEach(btn => {
+        btn.removeEventListener('click', cartPlusHandler);
+        btn.addEventListener('click', cartPlusHandler);
+    });
+    document.querySelectorAll('.cart-remove').forEach(btn => {
+        btn.removeEventListener('click', cartRemoveHandler);
+        btn.addEventListener('click', cartRemoveHandler);
+    });
+}
+
+function cartMinusHandler(e) {
+    const id = e.currentTarget.getAttribute('data-id');
+    updateCartItem(id, 'dec');
+}
+function cartPlusHandler(e) {
+    const id = e.currentTarget.getAttribute('data-id');
+    updateCartItem(id, 'inc');
+}
+function cartRemoveHandler(e) {
+    const id = e.currentTarget.getAttribute('data-id');
+    updateCartItem(id, 'remove');
+}
+
+function updateCartItem(id, action) {
+    fetch('ajax_cart.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'id=' + encodeURIComponent(id) + '&action=' + encodeURIComponent(action)
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.success) {
+            updateCartUI(data.cart);
+            updateMenuQuantities(data.cart);
+        } else {
+            alert(data.error || 'Error updating cart');
+        }
+    })
+    .catch(err => console.error(err));
+}
+
+function updateMenuQuantities(cart) {
+    document.querySelectorAll('.menu-card').forEach(card => {
+        const id = card.getAttribute('data-id');
+        const qtySpan = document.getElementById('qty-' + id);
+        if (qtySpan) {
+            const qty = (cart && cart[id]) ? cart[id].quantity : 0;
+            qtySpan.textContent = qty;
+        }
+    });
+}
+
+document.querySelectorAll('.plus-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+        const id = this.getAttribute('data-id');
+        updateCartItem(id, 'inc');
+    });
+});
+document.querySelectorAll('.minus-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+        const id = this.getAttribute('data-id');
+        updateCartItem(id, 'dec');
+    });
+});
+
+function refreshQueue() {
+    fetch('queue_data.php')
+        .then(r => r.json())
+        .then(data => {
+            const myCode = <?php echo json_encode($my_code ?: ''); ?>;
+            const grid = document.getElementById('queue-grid');
+            if (!grid) return;
+            let prepHtml = '';
+            if (data.preparing.length === 0) {
+                prepHtml = '<div class="queue-empty"><div class="eq-icon"></div>No orders in queue</div>';
+            } else {
+                data.preparing.forEach((ord, i) => {
+                    const mine = myCode && ord.code === myCode;
+                    prepHtml += `<div class="queue-item s-waiting${mine ? ' my-order' : ''}">
+                        <span class="q-num">#${i+1}</span>
+                        <span class="q-code">${ord.code}</span>
+                        ${mine ? '<span class="my-tag">YOUR ORDER</span>' : ''}
+                        <span class="q-time">${ord.time}</span>
+                    </div>`;
+                });
+            }
+            grid.querySelector('.queue-panel:first-child .queue-list').innerHTML = prepHtml;
+            grid.querySelector('.queue-panel:first-child .panel-count').textContent =
+                data.preparing.length + ' order' + (data.preparing.length !== 1 ? 's' : '');
+            let servHtml = '';
+            if (data.serving.length === 0) {
+                servHtml = '<div class="queue-empty"><div class="eq-icon"></div>No orders ready yet</div>';
+            } else {
+                data.serving.forEach(ord => {
+                    const mine = myCode && ord.code === myCode;
+                    servHtml += `<div class="queue-item s-serving${mine ? ' my-order' : ''}">
+                        <span class="q-code">${ord.code}</span>
+                        ${mine ? '<span class="my-tag">YOUR ORDER</span>' : ''}
+                        <span class="q-time">${ord.time}</span>
+                    </div>`;
+                });
+            }
+            grid.querySelector('.queue-panel:last-child .queue-list').innerHTML = servHtml;
+            grid.querySelector('.queue-panel:last-child .panel-count').textContent =
+                data.serving.length + ' order' + (data.serving.length !== 1 ? 's' : '');
+        })
+        .catch(() => {});
+}
+setInterval(refreshQueue, 5000);
+</script>
 
 </body>
 </html>

@@ -35,7 +35,6 @@ STATUS_COLORS = {
 }
 
 def generate_order_code():
-    """Generate next sequential order code like 00001, 00002, 00003..."""
     conn = connect_db()
     if not conn:
         return "00001"
@@ -45,7 +44,6 @@ def generate_order_code():
     conn.close()
     if last and last[0] and last[0].isdigit():
         return str(int(last[0]) + 1).zfill(5)
-    # If no orders yet or old format codes exist, count total orders + 1
     conn = connect_db()
     if not conn:
         return "00001"
@@ -145,22 +143,43 @@ def confirm_order(order_id, tree, details_card, status_filter_var, from_modal=Fa
     if not conn:
         return False
     cursor = conn.cursor()
-    cursor.execute("SELECT status FROM orders WHERE id = %s", (order_id,))
-    status = cursor.fetchone()
-    if not status or status[0] != 'pending':
-        messagebox.showwarning("Invalid", "Only pending orders can be confirmed.")
-        conn.close()
-        return False
-    if not messagebox.askyesno("Confirm Order", "Confirm this order? It will be added to the queue."):
-        conn.close()
-        return False
     try:
+        cursor.execute("SELECT status FROM orders WHERE id = %s FOR UPDATE", (order_id,))
+        status_row = cursor.fetchone()
+        if not status_row or status_row[0] != 'pending':
+            messagebox.showwarning("Invalid", "Only pending orders can be confirmed.")
+            return False
+        cursor.execute("SELECT menu_id, quantity FROM order_items WHERE order_id = %s", (order_id,))
+        items = cursor.fetchall()
+        if not items:
+            messagebox.showerror("Error", "Order has no items.")
+            return False
+        insufficient = []
+        for menu_id, qty in items:
+            cursor.execute("SELECT stock, name FROM menu WHERE id = %s FOR UPDATE", (menu_id,))
+            row = cursor.fetchone()
+            if not row:
+                insufficient.append(f"Item ID {menu_id} not found")
+            elif row[0] < qty:
+                insufficient.append(f"{row[1]} (stock: {row[0]}, needed: {qty})")
+        if insufficient:
+            cursor.execute("ROLLBACK")
+            messagebox.showerror("Insufficient Stock", "Cannot confirm order:\n" + "\n".join(insufficient))
+            conn.close()
+            return False
+        if not messagebox.askyesno("Confirm Order", "Confirm this order? Stock will be deducted."):
+            cursor.execute("ROLLBACK")
+            conn.close()
+            return False
+        for menu_id, qty in items:
+            cursor.execute("UPDATE menu SET stock = stock - %s WHERE id = %s", (qty, menu_id))
         cursor.execute("UPDATE orders SET status = 'waiting' WHERE id = %s", (order_id,))
         conn.commit()
-        messagebox.showinfo("Success", "Order confirmed and added to queue.")
+        messagebox.showinfo("Success", "Order confirmed. Stock deducted.")
         refresh_orders(tree, details_card, status_filter_var.get())
         return True
     except mysql.connector.Error as err:
+        cursor.execute("ROLLBACK")
         messagebox.showerror("Database Error", str(err))
         return False
     finally:
@@ -424,19 +443,6 @@ def edit_order(order_id, tree, details_card, status_filter_var):
                         VALUES (%s, %s, %s, %s)
                     """, (order_id, mid, qty, data['price']))
                     total += data['price'] * qty
-
-            cursor.execute("SELECT menu_id, quantity FROM order_items WHERE order_id = %s", (order_id,))
-            new_items = {row[0]: row[1] for row in cursor.fetchall()}
-
-            orig_qtys = {oi['menu_id']: oi['quantity'] for oi in order_items}
-            all_mids = set(list(orig_qtys.keys()) + list(new_items.keys()))
-            for mid in all_mids:
-                old_q = orig_qtys.get(mid, 0)
-                new_q = new_items.get(mid, 0)
-                diff = old_q - new_q
-                if diff != 0:
-                    cursor.execute("UPDATE menu SET stock = stock + %s WHERE id = %s", (diff, mid))
-
             cursor.execute("UPDATE orders SET total_amount = %s WHERE id = %s", (total, order_id))
             conn.commit()
             messagebox.showinfo("Success", "Order updated successfully.")
@@ -914,19 +920,16 @@ def direct_order(tree, details_card, status_filter_var):
             conn.close()
             return
 
-        # Sequential order code: 00001, 00002, 00003 ...
         cursor.execute("SELECT MAX(CAST(order_code AS UNSIGNED)) FROM orders WHERE order_code REGEXP '^[0-9]+$'")
         last_num = cursor.fetchone()[0]
         order_code = str((last_num or 0) + 1).zfill(5)
 
-        # Insert order without customer_name
         cursor.execute("INSERT INTO orders (order_code, total_amount, status) VALUES (%s, %s, 'pending')",
                        (order_code, total))
         order_id = cursor.lastrowid
         for pid, item in cart.items():
             cursor.execute("INSERT INTO order_items (order_id, menu_id, quantity, price) VALUES (%s, %s, %s, %s)",
                            (order_id, pid, item['quantity'], item['price']))
-            cursor.execute("UPDATE menu SET stock = stock - %s WHERE id = %s", (item['quantity'], pid))
         conn.commit()
         conn.close()
 
@@ -943,7 +946,7 @@ def direct_order(tree, details_card, status_filter_var):
 
         change = paid - float(total)
         messagebox.showinfo("Order Placed",
-                            f"Order Code: {order_code}\nTotal: ₱{total:.2f}\nPaid: ₱{paid:.2f}\nChange: ₱{change:.2f}")
+                            f"Order Code: {order_code}\nTotal: ₱{total:.2f}\nPaid: ₱{paid:.2f}\nChange: ₱{change:.2f}\n\nStock will be deducted when order is confirmed.")
         direct_win.destroy()
         refresh_orders(tree, details_card, status_filter_var.get())
 

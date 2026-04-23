@@ -34,3 +34,11 @@ ALTER TABLE menu ADD COLUMN stock INT DEFAULT 0;
 sudo cp -r ~/Documents/app /opt/lampp/htdocs/
 
 pip install opencv-python pyzbar pillow mysql-connector-python
+
+
+cd /opt/lampp/htdocs/app
+python3 -m venv venv
+source venv/bin/activate
+
+(venv) black@black:/opt/lampp/htdocs/app$ sudo apt install xvfb
+xvfb-run python3 main.py
