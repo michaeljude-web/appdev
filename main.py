@@ -10,6 +10,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
 from kivy.uix.screenmanager import ScreenManager, Screen
+from kivy.core.window import Window
 from kivymd.app import MDApp
 from kivymd.uix.toolbar import MDTopAppBar
 from kivymd.uix.button import MDRectangleFlatButton, MDRaisedButton
@@ -22,6 +23,9 @@ from io import BytesIO
 import threading
 import time
 import os
+
+Window.size = (720, 1280)
+Window.clearcolor = (0.05, 0.05, 0.05, 1)
 
 DB_HOST = "localhost"
 DB_USER = "root"
@@ -101,14 +105,14 @@ class ProductCard(MDCard):
         self.product = product
         self.cart_callback = cart_callback
         self.size_hint = (None, None)
-        self.size = (180, 220)
+        self.size = (220, 320)
         self.md_bg_color = (0.09, 0.09, 0.09, 1)
         self.radius = 15
 
         self.layout = BoxLayout(orientation='vertical', spacing=5, padding=8)
         self.add_widget(self.layout)
 
-        self.img = Image(size_hint=(1, 0.5), keep_ratio=True)
+        self.img = Image(size_hint=(1, 0.55), keep_ratio=True)
         self.layout.add_widget(self.img)
         self.load_image()
 
@@ -160,19 +164,82 @@ class ProductCard(MDCard):
             self.qty_label.text = str(current - 1)
             self.cart_callback(self.product['id'], 'remove')
 
+class CartItemRow(BoxLayout):
+    def __init__(self, product_id, name, price, quantity, update_callback, **kwargs):
+        super().__init__(**kwargs)
+        self.product_id = product_id
+        self.update_callback = update_callback
+        self.size_hint_y = None
+        self.height = 120
+        self.spacing = 10
+        self.padding = 5
+
+        self.img = Image(size_hint=(0.25, 1), keep_ratio=True)
+        self.add_widget(self.img)
+        self.load_product_image(product_id)
+
+        info_layout = BoxLayout(orientation='vertical', size_hint_x=0.45)
+        info_layout.add_widget(Label(text=name, size_hint_y=0.4, font_size='14sp'))
+        info_layout.add_widget(Label(text=f"₱{price:.2f} each", size_hint_y=0.3, font_size='12sp'))
+        self.add_widget(info_layout)
+
+        qty_box = BoxLayout(size_hint_x=0.2, spacing=5)
+        minus_btn = Button(text='-', on_press=lambda x: self.change_quantity(-1))
+        qty_label = Label(text=str(quantity))
+        plus_btn = Button(text='+', on_press=lambda x: self.change_quantity(1))
+        qty_box.add_widget(minus_btn)
+        qty_box.add_widget(qty_label)
+        qty_box.add_widget(plus_btn)
+        self.add_widget(qty_box)
+
+        self.subtotal_label = Label(text=f"₱{price * quantity:.2f}", size_hint_x=0.2)
+        self.add_widget(self.subtotal_label)
+
+        self.qty_label = qty_label
+        self.price = price
+
+    def load_product_image(self, product_id):
+        product = db.execute_query("SELECT image_path FROM menu WHERE id = %s", (product_id,), fetch=True)
+        if product and product[0].get('image_path'):
+            url = IMAGE_BASE_URL + os.path.basename(product[0]['image_path'])
+            load_image_from_url(url, self.set_texture)
+        else:
+            self.set_texture(None)
+
+    def set_texture(self, texture):
+        if texture:
+            self.img.texture = texture
+        else:
+            self.img.texture = None
+
+    def change_quantity(self, delta):
+        new_qty = int(self.qty_label.text) + delta
+        if new_qty <= 0:
+            self.update_callback(self.product_id, 0)
+        else:
+            stock = db.execute_query("SELECT stock FROM menu WHERE id = %s", (self.product_id,), fetch=True)
+            if stock and new_qty <= stock[0]['stock']:
+                self.qty_label.text = str(new_qty)
+                self.subtotal_label.text = f"₱{self.price * new_qty:.2f}"
+                self.update_callback(self.product_id, new_qty)
+            else:
+                dialog = MDDialog(title="Stock Error", text=f"Only {stock[0]['stock']} available.")
+                dialog.open()
+
 class MenuScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.cart = {}
+        self.current_category_name = "All"
         self.build_ui()
+        self.start_queue_polling()
 
     def build_ui(self):
-        layout = BoxLayout(orientation='vertical')
+        main_layout = BoxLayout(orientation='vertical')
 
         top_bar = MDTopAppBar(title="Snack in Save", elevation=4,
-                              left_action_items=[["menu", lambda x: None]],
                               right_action_items=[["cart", lambda x: self.go_to_cart()]])
-        layout.add_widget(top_bar)
+        main_layout.add_widget(top_bar)
 
         categories = db.execute_query("SELECT id, name FROM categories ORDER BY name", fetch=True)
         if not categories:
@@ -185,21 +252,66 @@ class MenuScreen(Screen):
         cat_layout.bind(minimum_width=cat_layout.setter('width'))
         for cat in categories:
             btn = MDRectangleFlatButton(text=cat['name'], size_hint=(None, 1), width=100)
-            btn.bind(on_press=lambda x, cid=cat['id']: self.load_products(cid))
+            btn.bind(on_press=lambda x, cid=cat['id'], cname=cat['name']: self.load_products(cid, cname))
             cat_layout.add_widget(btn)
         cat_scroll.add_widget(cat_layout)
-        layout.add_widget(cat_scroll)
+        main_layout.add_widget(cat_scroll)
+
+        self.category_label = MDLabel(text="Category: All", halign='center', font_style='Subtitle1', size_hint_y=None, height=30)
+        main_layout.add_widget(self.category_label)
 
         self.products_grid = GridLayout(cols=2, spacing=10, size_hint_y=None, padding=10)
         self.products_grid.bind(minimum_height=self.products_grid.setter('height'))
+        products_scroll = ScrollView()
+        products_scroll.add_widget(self.products_grid)
+        main_layout.add_widget(products_scroll)
+
+        queue_layout = BoxLayout(orientation='horizontal', size_hint_y=0.35, spacing=10, padding=10)
+        self.prepare_panel = self.make_queue_panel("PREPARING")
+        self.serving_panel = self.make_queue_panel("NOW SERVING")
+        queue_layout.add_widget(self.prepare_panel)
+        queue_layout.add_widget(self.serving_panel)
+        main_layout.add_widget(queue_layout)
+
+        self.add_widget(main_layout)
+        self.load_products(0, "All")
+
+    def make_queue_panel(self, title):
+        panel = BoxLayout(orientation='vertical', size_hint=(0.5, 1))
+        header = MDLabel(text=title, halign='center', font_style='H6', size_hint_y=None, height=40)
+        panel.add_widget(header)
         scroll = ScrollView()
-        scroll.add_widget(self.products_grid)
-        layout.add_widget(scroll)
+        list_view = GridLayout(cols=1, size_hint_y=None, spacing=5)
+        list_view.bind(minimum_height=list_view.setter('height'))
+        scroll.add_widget(list_view)
+        panel.add_widget(scroll)
+        panel.list_view = list_view
+        return panel
 
-        self.add_widget(layout)
-        self.load_products(0)
+    def start_queue_polling(self):
+        def poll():
+            while True:
+                waiting = db.execute_query("SELECT order_code, created_at FROM orders WHERE status = 'waiting' ORDER BY created_at ASC LIMIT 30", fetch=True)
+                serving = db.execute_query("SELECT order_code, created_at FROM orders WHERE status = 'serving' ORDER BY created_at ASC LIMIT 10", fetch=True)
+                Clock.schedule_once(lambda dt: self.refresh_queue_panels(waiting, serving))
+                time.sleep(5)
+        thread = threading.Thread(target=poll, daemon=True)
+        thread.start()
 
-    def load_products(self, category_id):
+    def refresh_queue_panels(self, waiting, serving):
+        self.prepare_panel.list_view.clear_widgets()
+        self.serving_panel.list_view.clear_widgets()
+
+        for idx, order in enumerate(waiting):
+            item = OneLineListItem(text=f"#{idx+1}  {order['order_code']}  {order['created_at'].strftime('%H:%M')}")
+            self.prepare_panel.list_view.add_widget(item)
+        for order in serving:
+            item = OneLineListItem(text=f"{order['order_code']}  {order['created_at'].strftime('%H:%M')}")
+            self.serving_panel.list_view.add_widget(item)
+
+    def load_products(self, category_id, category_name):
+        self.current_category_name = category_name
+        self.category_label.text = f"Category: {category_name}"
         self.products_grid.clear_widgets()
         if category_id == 0:
             products = db.execute_query("SELECT id, name, price, stock, image_path FROM menu ORDER BY name", fetch=True)
@@ -229,10 +341,6 @@ class MenuScreen(Screen):
                 self.cart[product_id]['quantity'] -= 1
                 if self.cart[product_id]['quantity'] == 0:
                     del self.cart[product_id]
-        self.update_cart_badge()
-
-    def update_cart_badge(self):
-        total_items = sum(item['quantity'] for item in self.cart.values())
 
     def go_to_cart(self):
         app = MDApp.get_running_app()
@@ -270,41 +378,21 @@ class CartScreen(Screen):
         self.cart_layout.clear_widgets()
         total = 0
         for pid, item in self.cart.items():
-            subtotal = item['price'] * item['quantity']
-            total += subtotal
-            row = BoxLayout(size_hint_y=None, height=60, spacing=10)
-            row.add_widget(Label(text=item['name'], size_hint_x=0.4))
-            row.add_widget(Label(text=f"₱{item['price']:.2f}", size_hint_x=0.2))
-            qty_box = BoxLayout(size_hint_x=0.2, spacing=5)
-            minus_btn = Button(text='-', on_press=lambda x, pid=pid: self.change_quantity(pid, -1))
-            qty_label = Label(text=str(item['quantity']))
-            plus_btn = Button(text='+', on_press=lambda x, pid=pid: self.change_quantity(pid, 1))
-            qty_box.add_widget(minus_btn)
-            qty_box.add_widget(qty_label)
-            qty_box.add_widget(plus_btn)
-            row.add_widget(qty_box)
-            row.add_widget(Label(text=f"₱{subtotal:.2f}", size_hint_x=0.2))
+            total += item['price'] * item['quantity']
+            row = CartItemRow(pid, item['name'], item['price'], item['quantity'], self.change_quantity)
             self.cart_layout.add_widget(row)
         self.total_label.text = f"Total: ₱{total:.2f}"
 
-    def change_quantity(self, product_id, delta):
-        if product_id in self.cart:
-            new_qty = self.cart[product_id]['quantity'] + delta
-            if new_qty <= 0:
+    def change_quantity(self, product_id, new_quantity):
+        if new_quantity <= 0:
+            if product_id in self.cart:
                 del self.cart[product_id]
-            else:
-                stock = db.execute_query("SELECT stock FROM menu WHERE id = %s", (product_id,), fetch=True)
-                if stock and new_qty <= stock[0]['stock']:
-                    self.cart[product_id]['quantity'] = new_qty
-                else:
-                    popup = MDDialog(title="Stock Error", text=f"Only {stock[0]['stock']} available.")
-                    popup.open()
-                    return
+        else:
+            self.cart[product_id]['quantity'] = new_quantity
         self.update_cart(self.cart)
         app = MDApp.get_running_app()
         menu_screen = app.root.get_screen('menu')
         menu_screen.cart = self.cart
-        menu_screen.update_cart_badge()
 
     def go_back(self):
         app = MDApp.get_running_app()
@@ -416,65 +504,7 @@ class SuccessScreen(Screen):
         app.root.current = 'menu'
         menu_screen = app.root.get_screen('menu')
         menu_screen.cart = {}
-        menu_screen.update_cart_badge()
-        menu_screen.load_products(0)
-
-class QueueScreen(Screen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.build_ui()
-        self.poll_queue()
-
-    def build_ui(self):
-        layout = BoxLayout(orientation='vertical')
-        top_bar = MDTopAppBar(title="Live Queue", elevation=4, left_action_items=[["arrow-left", lambda x: self.go_back()]])
-        layout.add_widget(top_bar)
-
-        self.queue_layout = BoxLayout(orientation='horizontal', spacing=10, padding=10)
-        self.prepare_panel = self.make_panel("Preparing")
-        self.serving_panel = self.make_panel("Now Serving")
-        self.queue_layout.add_widget(self.prepare_panel)
-        self.queue_layout.add_widget(self.serving_panel)
-        layout.add_widget(self.queue_layout)
-
-        self.add_widget(layout)
-
-    def make_panel(self, title):
-        panel = BoxLayout(orientation='vertical', size_hint=(0.5, 1))
-        header = MDLabel(text=title, halign='center', font_style='H6', size_hint_y=None, height=40)
-        panel.add_widget(header)
-        scroll = ScrollView()
-        list_view = GridLayout(cols=1, size_hint_y=None, spacing=5)
-        list_view.bind(minimum_height=list_view.setter('height'))
-        scroll.add_widget(list_view)
-        panel.add_widget(scroll)
-        panel.list_view = list_view
-        return panel
-
-    def poll_queue(self):
-        def update():
-            while True:
-                waiting = db.execute_query("SELECT order_code, created_at FROM orders WHERE status = 'waiting' ORDER BY created_at ASC LIMIT 30", fetch=True)
-                serving = db.execute_query("SELECT order_code, created_at FROM orders WHERE status = 'serving' ORDER BY created_at ASC LIMIT 10", fetch=True)
-                Clock.schedule_once(lambda dt: self.refresh_panels(waiting, serving))
-                time.sleep(5)
-        thread = threading.Thread(target=update, daemon=True)
-        thread.start()
-
-    def refresh_panels(self, waiting, serving):
-        self.prepare_panel.list_view.clear_widgets()
-        self.serving_panel.list_view.clear_widgets()
-
-        for idx, order in enumerate(waiting):
-            item = OneLineListItem(text=f"#{idx+1}  {order['order_code']}  {order['created_at'].strftime('%H:%M')}")
-            self.prepare_panel.list_view.add_widget(item)
-        for order in serving:
-            item = OneLineListItem(text=f"{order['order_code']}  {order['created_at'].strftime('%H:%M')}")
-            self.serving_panel.list_view.add_widget(item)
-
-    def go_back(self):
-        app = MDApp.get_running_app()
-        app.root.current = 'menu'
+        menu_screen.load_products(0, "All")
 
 class SnackInSaveApp(MDApp):
     def build(self):
@@ -484,11 +514,9 @@ class SnackInSaveApp(MDApp):
         menu_screen = MenuScreen(name='menu')
         cart_screen = CartScreen(name='cart')
         success_screen = SuccessScreen(name='success')
-        queue_screen = QueueScreen(name='queue')
         sm.add_widget(menu_screen)
         sm.add_widget(cart_screen)
         sm.add_widget(success_screen)
-        sm.add_widget(queue_screen)
         return sm
 
 if __name__ == '__main__':
